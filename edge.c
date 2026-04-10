@@ -706,26 +706,29 @@ static void help() {
 /** Send a datagram to a socket defined by a n2n_sock_t */
 static ssize_t sendto_sock( SOCKET fd, const void * buf, size_t len, const n2n_sock_t * dest )
 {
-    /* sockaddr_in6 is larger than sockaddr_in so we use that */
     struct sockaddr_in6 peer_addr;
     ssize_t sent;
+    socklen_t addr_len;
 
-    fill_sockaddr( (struct sockaddr*) &peer_addr,
-                   sizeof(peer_addr),
-                   dest );
+    fill_sockaddr( (struct sockaddr*) &peer_addr, sizeof(peer_addr), dest );
+    addr_len = (dest->family == AF_INET6) ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
 
     sent = sendto( fd, buf, len, 0/*flags*/,
-                   (struct sockaddr*) &peer_addr, sizeof(struct sockaddr_in6) );
+                   (struct sockaddr*) &peer_addr, addr_len );
     if ( sent < 0 )
     {
 #ifdef _WIN32
         int error = WSAGetLastError();
-        W32_ERROR(error, c)
-        traceEvent( TRACE_ERROR, "sendto failed (%d) %ls", error, c );
-        W32_ERROR_FREE(c)
+        /* 10014 = WSAEFAULT: IPv6 socket sending to IPv4 address - silent */
+        /* 10047 = WSAEAFNOSUPPORT: IPv4 socket sending to IPv6 address - silent */
+        if ( error != 10014 && error != 10047 ) {
+            W32_ERROR(error, c)
+            traceEvent( TRACE_ERROR, "sendto failed (%d) %ls", error, c );
+            W32_ERROR_FREE(c)
+        }
 #else
         char * c = strerror(errno);
-        traceEvent( TRACE_ERROR, "sendto failed (%d) %s", errno, c );
+        traceEvent( TRACE_DEBUG, "sendto failed (%d) %s", errno, c );
 #endif
     }
     else
@@ -2547,6 +2550,12 @@ static void readFromIPSocket( n2n_edge_t * eee )
                                sock_to_cstr(sockbuf1, &lan_sock));
                     try_send_register_lan(eee, 1, pi.mac, &pi.sockets[0], &lan_sock);
                 }
+                else if (pi.sockets[0].family != eee->supernode.family)
+                {
+                    /* Address family mismatch - can't punch directly, supernode will relay */
+                    traceEvent(TRACE_DEBUG, "Peer %s addr family mismatch, relay only",
+                               macaddr_str(mac_buf1, pi.mac));
+                }
                 else
                 {
                     try_send_register(eee, 1, pi.mac, &pi.sockets[0]);
@@ -2583,6 +2592,11 @@ static void readFromIPSocket( n2n_edge_t * eee )
                     n2n_sock_t lan_sock = pi.sockets[1];
                     lan_sock.port = pi.sockets[0].port;
                     try_send_register_lan(eee, 1, pi.mac, &pi.sockets[0], &lan_sock);
+                }
+                else if (pi.sockets[0].family != eee->supernode.family)
+                {
+                    traceEvent(TRACE_DEBUG, "Peer %s addr family mismatch on re-punch, relay only",
+                               macaddr_str(mac_buf1, pi.mac));
                 }
                 else
                 {
