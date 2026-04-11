@@ -1990,6 +1990,28 @@ static int handle_PACKET( n2n_edge_t * eee,
 
             /* Write ethernet packet to tap device. */
             traceEvent( TRACE_INFO, "sending to TAP %u", (unsigned int)eth_size );
+
+            /* Extract sender's virtual IP from first packet if not yet known */
+            if ( eth_size >= 34 ) {
+                uint16_t ethertype = (eth_payload[12] << 8) | eth_payload[13];
+                uint32_t src_ip = 0;
+                if ( ethertype == 0x0800 && eth_size >= 34 ) {
+                    /* IPv4: source IP at offset 26 */
+                    memcpy(&src_ip, eth_payload + 26, 4);
+                } else if ( ethertype == 0x0806 && eth_size >= 42 ) {
+                    /* ARP: sender IP at offset 28 */
+                    memcpy(&src_ip, eth_payload + 28, 4);
+                }
+                if ( src_ip != 0 ) {
+                    PEERS_LOCK(eee);
+                    struct peer_info *sp = find_peer_by_mac(eee->known_peers, pkt->srcMac);
+                    if ( !sp ) sp = find_peer_by_mac(eee->pending_peers, pkt->srcMac);
+                    if ( sp && sp->assigned_ip == 0 )
+                        sp->assigned_ip = ntohl(src_ip);
+                    PEERS_UNLOCK(eee);
+                }
+            }
+
             data_sent_len = tuntap_write(&(eee->device), eth_payload, eth_size);
 
             if (data_sent_len == eth_size)
@@ -2254,11 +2276,19 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
     int days = uptime / 86400;
     int hours = (uptime % 86400) / 3600;
     msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE,
-                       "uptime %d_%dh | pend/known_peers %u/%u | last_super/p2p %lu/%lus ago\n",
-                       days, hours,
-                       (unsigned int)peer_list_size(eee->pending_peers),
-                       (unsigned int)peer_list_size(eee->known_peers),
-                       (now - eee->last_sup), (now - eee->last_p2p));
+    {
+        char sup_str[32], p2p_str[32];
+        if (eee->last_sup) snprintf(sup_str, sizeof(sup_str), "%lus ago", (unsigned long)(now - eee->last_sup));
+        else strcpy(sup_str, "never");
+        if (eee->last_p2p) snprintf(p2p_str, sizeof(p2p_str), "%lus ago", (unsigned long)(now - eee->last_p2p));
+        else strcpy(p2p_str, "never");
+        msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE,
+                           "uptime %d_%dh | pend/known_peers %u/%u | last_super/p2p %s/%s\n",
+                           days, hours,
+                           (unsigned int)peer_list_size(eee->pending_peers),
+                           (unsigned int)peer_list_size(eee->known_peers),
+                           sup_str, p2p_str);
+    }
     sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
            (struct sockaddr*) &sender_sock, i);
 
@@ -2725,7 +2755,16 @@ static void readFromIPSocket( n2n_edge_t * eee )
                     eee->register_lifetime = min( eee->register_lifetime, REGISTER_SUPER_INTERVAL_MAX );
 
                     /* Store supernode version */
-                    strcpy(eee->supernode_version, "cnn2n");
+                    strcpy(eee->supernode_version, n2n_sw_version);
+
+                    /* Set IP support based on connection type */
+                    if (eee->supernode.family == AF_INET6) {
+                        eee->sn_ipv6_support = 1;
+                        eee->sn_ipv4_support = 0;
+                    } else {
+                        eee->sn_ipv4_support = 1;
+                        eee->sn_ipv6_support = 0;
+                    }
 
                     /* Do NOT clear pending_peers here - hole-punch may be in progress */
                 }
