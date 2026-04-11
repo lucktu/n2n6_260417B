@@ -2416,6 +2416,34 @@ static void readFromIPSocket( n2n_edge_t * eee )
                         scan->last_probe_sent = 0;
                         scan->keepalive_fails = 0;
                         send_register(eee, orig_sender);
+
+                        /* *** Move peer back to pending_peers for re-punch *** */
+                        struct peer_info *prev = NULL, *curr = eee->known_peers;
+                        while (curr && memcmp(curr->mac_addr, reg.srcMac, N2N_MAC_SIZE) != 0) {
+                            prev = curr;
+                            curr = curr->next;
+                        }
+                        if (curr) {
+                            /* Remove from known_peers */
+                            if (prev) prev->next = curr->next;
+                            else eee->known_peers = curr->next;
+
+                            /* Reset punch state */
+                            curr->punch_start_time = 0;
+                            curr->punch_failed = 0;
+                            curr->lan_punch_start = 0;
+                            curr->lan_punch_done = 0;
+
+                            /* Add to pending_peers */
+                            curr->next = eee->pending_peers;
+                            eee->pending_peers = curr;
+
+                            /* Start hole punching */
+                            start_punch(eee, curr);
+
+                            traceEvent(TRACE_INFO, "Moved peer %s back to pending for re-punch",
+                                       macaddr_str(mac_buf1, reg.srcMac));
+                        }
                     } else {
                         update_peer_address(eee, from_supernode, reg.srcMac, orig_sender, time(NULL));
                     }
