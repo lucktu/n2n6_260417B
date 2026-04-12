@@ -59,7 +59,10 @@ SOCKET open_socket(uint16_t local_port, int bind_any) {
     local_address.sin_addr.s_addr = htonl(bind_any?INADDR_ANY:INADDR_LOOPBACK);
 
     if(bind(sock_fd, (struct sockaddr*) &local_address, sizeof(local_address)) == -1) {
-        traceEvent(TRACE_ERROR, "Bind error [%s]\n", strerror(errno));
+        if(errno == EADDRINUSE)
+            traceEvent(TRACE_DEBUG, "Bind error [%s]\n", strerror(errno));
+        else
+            traceEvent(TRACE_ERROR, "Bind error [%s]\n", strerror(errno));
         closesocket(sock_fd);
         return -1;
     }

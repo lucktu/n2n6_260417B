@@ -99,7 +99,6 @@ typedef char n2n_sn_name_t[N2N_EDGE_SN_HOST_SIZE];
 #define N2N_EDGE_NUM_SUPERNODES 3
 #define N2N_EDGE_SUP_ATTEMPTS   3       /* Number of failed attmpts before moving on to next supernode. */
 
-static int first_ip_report_shown = 0;
 static int default_ip_assignment = 0;
 static int assigned_ip_suffix = 1;
 static int initial_connection_complete = 0;
@@ -2727,11 +2726,10 @@ static void readFromIPSocket( n2n_edge_t * eee )
 
 					if (default_ip_assignment && ra.dev_addr.net_addr != 0) {
 					  struct in_addr addr;
-					  addr.s_addr = htonl(ra.dev_addr.net_addr);
+					  addr.s_addr = ra.dev_addr.net_addr;
 					  char assigned_ip_str[INET_ADDRSTRLEN];
 					  inet_ntop(AF_INET, &addr, assigned_ip_str, sizeof(assigned_ip_str));
 
-					 /* Only show report on first time or when IP changes */
 					 int ip_changed = (eee->device.ip_addr != addr.s_addr);
 
 					 if (ip_changed) {
@@ -2743,11 +2741,6 @@ static void readFromIPSocket( n2n_edge_t * eee )
 						 } else {
 							  traceEvent(TRACE_NORMAL, "TAP interface configured with IP %s/%u", assigned_ip_str, eee->device.ip_prefixlen);
 							}
-					 }
-
-					  /* Only show report on first time or when IP changes */
-					 if (!first_ip_report_shown || ip_changed) {
-						 first_ip_report_shown = 1;
 					 }
 					}
 
@@ -3606,7 +3599,7 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
     }
 
     if ( (NULL == encrypt_key ) && ( 0 == strlen(eee.keyschedule)) ) {
-        traceEvent(TRACE_WARNING, "Encryption is disabled in edge.");
+        traceEvent(TRACE_DEBUG, "Encryption is disabled in edge.");
 
         eee.null_transop = 1;
     }
@@ -3615,11 +3608,10 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
         traceEvent(TRACE_NORMAL, "Dynamic IP address assignment enabled.");
 
         eee.dyn_ip_mode = 1;
-    } else {
-        traceEvent(TRACE_NORMAL, "ip_mode='%s'", ip_mode);
     }
 
     tuntap_config.if_name = tuntap_dev_name;
+    tuntap_config.community_name = (const char*)eee.community_name;
     if (device_mac[0] != '\0') {
         if (6 != sscanf(device_mac, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
             &tuntap_config.device_mac[0],
@@ -3708,13 +3700,12 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
       traceEvent(TRACE_NORMAL, "Using no encryption");
       eee.null_transop = 1;
   } else if (encrypt_mode == 2) {
-				  // B2 - Twofish
-			   traceEvent(TRACE_NORMAL, "Using Twofish encryption");
       if (!encrypt_key) {
           traceEvent(TRACE_WARNING, "No encryption key provided, falling back to no encryption");
           encrypt_mode = 1;
           eee.null_transop = 1;
       } else {
+          traceEvent(TRACE_NORMAL, "Using Twofish encryption");
           if(edge_init_twofish(&eee, (uint8_t*)(encrypt_key), strlen(encrypt_key)) < 0) {
               fprintf(stderr, "Error: twofish setup failed.\n");
               return(-1);

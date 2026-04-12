@@ -217,6 +217,12 @@ int set_ipaddress(const tuntap_dev* device, int static_address) {
         req.nl.nlmsg_len = NLMSG_ALIGN(req.nl.nlmsg_len) + rta->rta_len;
         memcpy(RTA_DATA(rta), &device->ip_addr, sizeof(struct in_addr));
 
+        rta = (struct rtattr*) (((uint8_t*) &req) + NLMSG_ALIGN(req.nl.nlmsg_len));
+        rta->rta_len = RTA_LENGTH(sizeof(struct in_addr));
+        rta->rta_type = IFA_ADDRESS;
+        req.nl.nlmsg_len = NLMSG_ALIGN(req.nl.nlmsg_len) + rta->rta_len;
+        memcpy(RTA_DATA(rta), &device->ip_addr, sizeof(struct in_addr));
+
         if ((error = netlink_talk(_sock, &req)) != 0) {
             traceEvent(TRACE_ERROR, "netlink set_ip: [%s]", strerror(error));
             close(_sock);
@@ -387,6 +393,39 @@ int tuntap_open(tuntap_dev *device, struct tuntap_config* config) {
           config->device_mac[4] == 0 && config->device_mac[5] == 0))
     {
         set_mac(device->fd, config->if_name, config->device_mac);
+    } else {
+        /* Derive a stable MAC from the first physical NIC's hardware MAC */
+        n2n_mac_t derived_mac = { 0 };
+        int s2 = socket(PF_INET, SOCK_DGRAM, 0);
+        if (s2 >= 0) {
+            struct if_nameindex *ni = if_nameindex();
+            if (ni) {
+                for (struct if_nameindex *ii = ni; ii->if_index || ii->if_name; ii++) {
+                    if (strncmp(ii->if_name, "lo", 3) == 0) continue;
+                    if (strncmp(ii->if_name, "n2n", 3) == 0) continue;
+                    struct ifreq ifr2 = { 0 };
+                    strncpy(ifr2.ifr_name, ii->if_name, IFNAMSIZ);
+                    if (ioctl(s2, SIOCGIFHWADDR, &ifr2) < 0) continue;
+                    uint8_t *m = (uint8_t*)ifr2.ifr_hwaddr.sa_data;
+                    if (m[0]==0 && m[1]==0 && m[2]==0 && m[3]==0 && m[4]==0 && m[5]==0) continue;
+                    /* set locally-administered bit, clear multicast bit */
+                    derived_mac[0] = (m[0] & 0xFE) | 0x02;
+                    memcpy(derived_mac+1, m+1, 5);
+                    /* mix in community name so each community gets a distinct MAC */
+                    if (config->community_name) {
+                        const char *c = config->community_name;
+                        for (int k = 0; c[k]; k++)
+                            derived_mac[2 + (k % 4)] ^= (uint8_t)c[k];
+                    }
+                    break;
+                }
+                if_freenameindex(ni);
+            }
+            close(s2);
+        }
+        if (derived_mac[0] || derived_mac[1] || derived_mac[2] ||
+            derived_mac[3] || derived_mac[4] || derived_mac[5])
+            set_mac(device->fd, config->if_name, derived_mac);
     }
 
     /* Store the device name for later reuse */

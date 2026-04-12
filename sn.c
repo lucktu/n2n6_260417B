@@ -39,6 +39,40 @@
 
 static uint32_t next_assigned_ip = 0x0a400002; /* 10.64.0.2 */
 
+/* Persistent MAC -> IP mapping so the same edge always gets the same IP */
+struct mac_ip_entry {
+    n2n_mac_t        mac;
+    uint32_t         ip;   /* host byte order */
+    struct mac_ip_entry *next;
+};
+static struct mac_ip_entry *mac_ip_map = NULL;
+
+static uint32_t mac_ip_lookup(const n2n_mac_t mac) {
+    struct mac_ip_entry *e = mac_ip_map;
+    while (e) {
+        if (memcmp(e->mac, mac, sizeof(n2n_mac_t)) == 0)
+            return e->ip;
+        e = e->next;
+    }
+    return 0;
+}
+
+static void mac_ip_store(const n2n_mac_t mac, uint32_t ip) {
+    struct mac_ip_entry *e = mac_ip_map;
+    while (e) {
+        if (memcmp(e->mac, mac, sizeof(n2n_mac_t)) == 0) {
+            e->ip = ip;
+            return;
+        }
+        e = e->next;
+    }
+    e = calloc(1, sizeof(struct mac_ip_entry));
+    memcpy(e->mac, mac, sizeof(n2n_mac_t));
+    e->ip = ip;
+    e->next = mac_ip_map;
+    mac_ip_map = e;
+}
+
 /* ============================================================
  * Per-community traffic statistics and rate limiting
  * ============================================================ */
@@ -509,11 +543,19 @@ static int update_edge( n2n_sn_t * sss,
                            (assigned_ip>>24)&0xFF, (assigned_ip>>16)&0xFF,
                            (assigned_ip>>8)&0xFF, assigned_ip&0xFF);
             } else {
-                assigned_ip = next_assigned_ip++;
-                traceEvent(TRACE_INFO, "Auto-assigning IP 10.64.0.%u to edge %s",
-                           assigned_ip & 0xFF, macaddr_str(mac_buf, edgeMac));
-                if ((assigned_ip & 0xFF) > 254) {
-                    next_assigned_ip = 0x0a400002;
+                uint32_t cached_ip = mac_ip_lookup(edgeMac);
+                if (cached_ip != 0) {
+                    assigned_ip = cached_ip;
+                    traceEvent(TRACE_INFO, "Reusing IP 10.64.0.%u for edge %s",
+                               assigned_ip & 0xFF, macaddr_str(mac_buf, edgeMac));
+                } else {
+                    assigned_ip = next_assigned_ip++;
+                    traceEvent(TRACE_INFO, "Auto-assigning IP 10.64.0.%u to edge %s",
+                               assigned_ip & 0xFF, macaddr_str(mac_buf, edgeMac));
+                    if ((assigned_ip & 0xFF) > 254) {
+                        next_assigned_ip = 0x0a400002;
+                    }
+                    mac_ip_store(edgeMac, assigned_ip);
                 }
             }
             scan->assigned_ip = assigned_ip;
@@ -1376,14 +1418,12 @@ static int process_udp( n2n_sn_t * sss,
 
         /* Extract dev_addr (net_addr + net_bitlen) from ntop's n2n_v2 */
         uint32_t extra_requested_ip = 0;
-        uint8_t extra_net_bitlen = 0;
         size_t dev_idx = reg_start_idx + N2N_COOKIE_SIZE + N2N_MAC_SIZE;
         size_t dev_rem = udp_size - dev_idx;
         size_t dev_pos = dev_idx;
         if (dev_rem >= 5) {
             decode_uint32(&extra_requested_ip, udp_buf, &dev_rem, &dev_pos);
             extra_requested_ip = ntohl(extra_requested_ip);
-            decode_uint8(&extra_net_bitlen, udp_buf, &dev_rem, &dev_pos);
         }
 
         cmn2.ttl = N2N_DEFAULT_TTL;
@@ -1418,7 +1458,7 @@ static int process_udp( n2n_sn_t * sss,
         if (extra_requested_ip != 0) {
             use_requested_ip = extra_requested_ip;
         }
-        uint8_t use_request_ip = (use_requested_ip != 0 || reg.dev_addr.net_bitlen == 0) ? 1 : 0;
+        uint8_t use_request_ip = 1; /* always assign IP (auto-assign if net_addr==0) */
 
         const n2n_sock_t *local_sock_ptr = (reg.aflags & N2N_AFLAGS_LOCAL_SOCKET) ? &reg.local_sock : NULL;
         uint8_t local_sock_ena = (reg.aflags & N2N_AFLAGS_LOCAL_SOCKET) ? 1 : 0;

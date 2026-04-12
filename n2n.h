@@ -175,6 +175,7 @@ struct tuntap_config {
     /* device configuration */
     char* if_name;
     n2n_mac_t device_mac;
+    const char* community_name;
     int mtu;
     /* ipv4 configuration */
     bool dyn_ip4;
