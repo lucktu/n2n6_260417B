@@ -1721,9 +1721,7 @@ int main( int argc, char * const argv[] )
         traceEvent( TRACE_NORMAL, "Supernode running in IPv6 only mode" );
     }
 
-#ifndef _WIN32
-        sss.mgmt_sock = open_socket(sss.mgmt_port, 0 /* bind LOOPBACK */ );
-#endif // _WIN32
+    sss.mgmt_sock = open_socket(sss.mgmt_port, 0 /* bind LOOPBACK */ );
     if ( -1 == sss.mgmt_sock )
     {
 #ifdef _WIN32
@@ -1735,9 +1733,7 @@ int main( int argc, char * const argv[] )
 #endif
         exit(-2);
     }
-#ifndef _WIN32
-        traceEvent( TRACE_NORMAL, "supernode is listening on UDP %u (management)", sss.mgmt_port );
-#endif // _WIN32
+    traceEvent( TRACE_NORMAL, "supernode is listening on UDP %u (management)", sss.mgmt_port );
     traceEvent(TRACE_NORMAL, "supernode started");
 
 #if defined(N2N_HAVE_DAEMON)
