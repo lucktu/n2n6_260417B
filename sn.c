@@ -38,41 +38,12 @@
 #include <poll.h>
 #endif
 
-static uint32_t next_assigned_ip = 0x0a400002; /* 10.64.0.2 */
-
-/* Persistent MAC -> IP mapping so the same edge always gets the same IP */
+/* Per-community MAC -> IP mapping so the same edge always gets the same IP */
 struct mac_ip_entry {
     n2n_mac_t        mac;
     uint32_t         ip;   /* host byte order */
     struct mac_ip_entry *next;
 };
-static struct mac_ip_entry *mac_ip_map = NULL;
-
-static uint32_t mac_ip_lookup(const n2n_mac_t mac) {
-    struct mac_ip_entry *e = mac_ip_map;
-    while (e) {
-        if (memcmp(e->mac, mac, sizeof(n2n_mac_t)) == 0)
-            return e->ip;
-        e = e->next;
-    }
-    return 0;
-}
-
-static void mac_ip_store(const n2n_mac_t mac, uint32_t ip) {
-    struct mac_ip_entry *e = mac_ip_map;
-    while (e) {
-        if (memcmp(e->mac, mac, sizeof(n2n_mac_t)) == 0) {
-            e->ip = ip;
-            return;
-        }
-        e = e->next;
-    }
-    e = calloc(1, sizeof(struct mac_ip_entry));
-    memcpy(e->mac, mac, sizeof(n2n_mac_t));
-    e->ip = ip;
-    e->next = mac_ip_map;
-    mac_ip_map = e;
-}
 
 /* ============================================================
  * Per-community traffic statistics and rate limiting
@@ -115,6 +86,10 @@ struct community_stats {
     uint64_t tokens;            /* token bucket (bytes) */
     time_t   last_token_refill;
 
+    /* Per-community IP auto-assignment (10.64.0.2 .. 10.64.0.254) */
+    uint32_t next_ip;           /* host byte order, 0 = not yet initialised */
+    struct mac_ip_entry *mac_ip_map; /* MAC -> IP cache for this community */
+
     struct community_stats *next;
 };
 
@@ -145,6 +120,8 @@ static struct community_stats * get_community_stats(
     s->last_day    = now;
     s->last_minute = now;
     s->last_second = now;
+    s->next_ip     = 0x0a400002; /* 10.64.0.2 - per-community start */
+    s->mac_ip_map  = NULL;
     s->next = *head;
     *head = s;
     return s;
@@ -260,6 +237,13 @@ static void free_community_stats(struct community_stats **head)
     struct community_stats *s = *head;
     while (s) {
         struct community_stats *next = s->next;
+        /* Free per-community MAC->IP map */
+        struct mac_ip_entry *e = s->mac_ip_map;
+        while (e) {
+            struct mac_ip_entry *en = e->next;
+            free(e);
+            e = en;
+        }
         free(s);
         s = next;
     }
@@ -501,6 +485,8 @@ static void purge_expired_community_stats(n2n_sn_t *sss, time_t *p_last_purge, t
         if (idle >= 30 * 86400) {
             /* Remove entirely */
             *pp = s->next;
+            struct mac_ip_entry *e = s->mac_ip_map;
+            while (e) { struct mac_ip_entry *en = e->next; free(e); e = en; }
             free(s);
             continue;
         }
@@ -521,6 +507,8 @@ static void purge_expired_community_stats(n2n_sn_t *sss, time_t *p_last_purge, t
             /* If 30d traffic is now zero, remove */
             if (s->total_30d == 0) {
                 *pp = s->next;
+                struct mac_ip_entry *e = s->mac_ip_map;
+                while (e) { struct mac_ip_entry *en = e->next; free(e); e = en; }
                 free(s);
                 continue;
             }
@@ -729,19 +717,43 @@ static int update_edge( n2n_sn_t * sss,
                            (assigned_ip>>24)&0xFF, (assigned_ip>>16)&0xFF,
                            (assigned_ip>>8)&0xFF, assigned_ip&0xFF);
             } else {
-                uint32_t cached_ip = mac_ip_lookup(edgeMac);
+                /* Per-community IP assignment: get or create community stats entry */
+                struct community_stats *cs = get_community_stats(&sss->comm_stats, community, now);
+                uint32_t cached_ip = 0;
+                if (cs) {
+                    /* Look up MAC in this community's map */
+                    struct mac_ip_entry *e = cs->mac_ip_map;
+                    while (e) {
+                        if (memcmp(e->mac, edgeMac, sizeof(n2n_mac_t)) == 0) {
+                            cached_ip = e->ip;
+                            break;
+                        }
+                        e = e->next;
+                    }
+                }
                 if (cached_ip != 0) {
                     assigned_ip = cached_ip;
-                    traceEvent(TRACE_INFO, "Reusing IP 10.64.0.%u for edge %s",
-                               assigned_ip & 0xFF, macaddr_str(mac_buf, edgeMac));
+                    traceEvent(TRACE_INFO, "Reusing IP 10.64.0.%u for edge %s (community %s)",
+                               assigned_ip & 0xFF, macaddr_str(mac_buf, edgeMac), (char*)community);
                 } else {
-                    assigned_ip = next_assigned_ip++;
-                    traceEvent(TRACE_INFO, "Auto-assigning IP 10.64.0.%u to edge %s",
-                               assigned_ip & 0xFF, macaddr_str(mac_buf, edgeMac));
-                    if ((assigned_ip & 0xFF) > 254) {
-                        next_assigned_ip = 0x0a400002;
+                    if (cs) {
+                        assigned_ip = cs->next_ip++;
+                        if ((cs->next_ip & 0xFF) > 254)
+                            cs->next_ip = 0x0a400002; /* wrap back to .2 */
+                        /* Store in community's MAC->IP map */
+                        struct mac_ip_entry *ne = calloc(1, sizeof(struct mac_ip_entry));
+                        if (ne) {
+                            memcpy(ne->mac, edgeMac, sizeof(n2n_mac_t));
+                            ne->ip = assigned_ip;
+                            ne->next = cs->mac_ip_map;
+                            cs->mac_ip_map = ne;
+                        }
+                    } else {
+                        /* Fallback: should not happen, but be safe */
+                        assigned_ip = 0x0a400002;
                     }
-                    mac_ip_store(edgeMac, assigned_ip);
+                    traceEvent(TRACE_INFO, "Auto-assigning IP 10.64.0.%u to edge %s (community %s)",
+                               assigned_ip & 0xFF, macaddr_str(mac_buf, edgeMac), (char*)community);
                 }
             }
             scan->assigned_ip = assigned_ip;
