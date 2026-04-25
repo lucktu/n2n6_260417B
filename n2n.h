@@ -224,6 +224,8 @@ struct peer_info {
     n2n_sock_t          sock;              /* IPv4 public address (family=0 if unavailable) */
     n2n_sock_t          sock6;             /* IPv6 public address (family=0 if unavailable) */
     n2n_sock_t          sock_lan;          /* LAN address (family=0 if unavailable) */
+    n2n_sock_t          sock_lans[4];      /* Additional LAN addresses from peer */
+    int                 sock_lans_count;   /* Number of valid entries in sock_lans */
     time_t              last_seen;
     char                version[8];
     char                os_name[16];
@@ -240,6 +242,7 @@ struct peer_info {
     uint8_t             last_was_relay;    /* 1 = last packet was via relay (for state change detection) */
     time_t              lan_punch_start;   /* when LAN punch started */
     uint8_t             lan_punch_done;    /* 1 = LAN punch done (success or timeout) */
+    time_t              last_p2p;          /* last time direct P2P data was received */
 };
 
 struct n2n_edge; /* defined in edge.c */
