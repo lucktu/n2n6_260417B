@@ -659,14 +659,15 @@ static ssize_t sendto_sock( SOCKET fd, const void * buf, size_t len, const n2n_s
     {
 #ifdef _WIN32
         int error = WSAGetLastError();
-        /* Silently ignore address-family mismatch errors - these happen normally
-         * in dual-stack mode when an IPv4 socket tries to send to an IPv6 address
-         * or vice versa. */
         if ( error != 10014 &&   /* WSAEFAULT */
              error != 10047 &&   /* WSAEAFNOSUPPORT */
-             error != 10022 ) {  /* WSAEINVAL */
+             error != 10022 &&   /* WSAEINVAL */
+             error != 10054 &&   /* WSAECONNRESET */
+             error != 10051 &&   /* WSAENETUNREACH */
+             error != 10065 &&   /* WSAEHOSTUNREACH */
+             error != 10060 ) {  /* WSAETIMEDOUT */
             W32_ERROR(error, c)
-            traceEvent( TRACE_ERROR, "sendto failed (%d) %ls", error, c );
+            traceEvent( TRACE_DEBUG, "sendto failed (%d) %ls", error, c );
             W32_ERROR_FREE(c)
         }
 #else
@@ -1795,16 +1796,6 @@ static void update_peer_address(n2n_edge_t * eee,
  */
 static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
 {
-    if ( nowTime > (time_t) (eee->last_register_req + 30) )
-    {
-        eee->sn_wait = 0;
-        eee->sup_attempts = N2N_EDGE_SUP_ATTEMPTS;
-        send_register_super( eee, &(eee->supernode) );
-        eee->sn_wait = 1;
-        eee->last_register_req = nowTime;
-        return;
-    }
-
     if ( eee->sn_wait && ( nowTime > (time_t) (eee->last_register_req + (eee->register_lifetime/10) ) ) )
     {
         /* fall through - fast retry */
@@ -1829,12 +1820,25 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
 
     if(eee->re_resolve_supernode_ip)
     {
+        n2n_sock_t old_sn;
+        n2n_sock_t old_sn_alt;
+        memcpy(&old_sn, &(eee->supernode), sizeof(n2n_sock_t));
+        memcpy(&old_sn_alt, &(eee->supernode_alt), sizeof(n2n_sock_t));
+        
         supernode2addr(&(eee->supernode), eee->sn_af, eee->sn_ip_array[eee->sn_idx]);
         memset(&eee->supernode_alt, 0, sizeof(n2n_sock_t));
         {
             int alt_af = (eee->supernode.family == AF_INET6) ? AF_INET : AF_INET6;
             if (supernode2addr(&eee->supernode_alt, alt_af, eee->sn_ip_array[eee->sn_idx]) != 0)
                 memset(&eee->supernode_alt, 0, sizeof(n2n_sock_t));
+        }
+        
+        if (memcmp(&old_sn, &(eee->supernode), sizeof(n2n_sock_t)) != 0 ||
+            memcmp(&old_sn_alt, &(eee->supernode_alt), sizeof(n2n_sock_t)) != 0)
+        {
+            n2n_sock_str_t sockbuf;
+            traceEvent(TRACE_NORMAL, "Supernode address changed to %s",
+                       sock_to_cstr(sockbuf, &(eee->supernode)));
         }
     }
 
@@ -2234,27 +2238,22 @@ static int handle_PACKET( n2n_edge_t * eee,
                     if ( !sp ) sp = find_peer_by_mac(eee->pending_peers, pkt->srcMac);
                     if ( sp && sp->assigned_ip == 0 )
                         sp->assigned_ip = ntohl(src_ip);
-                    /* Log P2P/PsP status change only */
-                    if ( sp ) {
-                        int now_relay = from_supernode;
-                        int was_relay = sp->last_was_relay;
-                        /* Report only when state changes between P2P and PsP */
-                        if (!sp->first_seen || (now_relay != was_relay)) {
-                            sp->first_seen = 1;
-                            sp->last_was_relay = now_relay;
-                            char vip[INET_ADDRSTRLEN] = "-";
-                            if (sp->assigned_ip) {
-                                struct in_addr a;
-                                a.s_addr = htonl(sp->assigned_ip);
-                                inet_ntop(AF_INET, &a, vip, sizeof(vip));
-                            }
-                            n2n_sock_str_t sockbuf;
-                            if (now_relay)
-                                traceEvent(TRACE_NORMAL, "PsP relay with %s via supernode", vip);
-                            else
-                                traceEvent(TRACE_NORMAL, "P2P direct with %s at %s",
-                                           vip, sock_to_cstr(sockbuf, orig_sender));
+                    /* Log P2P/PsP status - only once per peer */
+                    if ( sp && !sp->first_seen ) {
+                        sp->first_seen = 1;
+                        sp->last_was_relay = from_supernode;
+                        char vip[INET_ADDRSTRLEN] = "-";
+                        if (sp->assigned_ip) {
+                            struct in_addr a;
+                            a.s_addr = htonl(sp->assigned_ip);
+                            inet_ntop(AF_INET, &a, vip, sizeof(vip));
                         }
+                        n2n_sock_str_t sockbuf;
+                        if (from_supernode)
+                            traceEvent(TRACE_NORMAL, "PsP relay with %s via supernode", vip);
+                        else
+                            traceEvent(TRACE_NORMAL, "P2P direct with %s at %s",
+                                       vip, sock_to_cstr(sockbuf, orig_sender));
                     }
                     PEERS_UNLOCK(eee);
                 }
@@ -2997,6 +2996,7 @@ static void readFromIPSocket( n2n_edge_t * eee, SOCKET fd )
                      * (from alt address family) just refresh last_sup silently. */
                     if ( eee->sn_ack_count == 1 ) {
                         eee->last_sup = now;
+                        eee->last_register_req = now;
                         eee->sn_wait = 0;
                         eee->sup_attempts = N2N_EDGE_SUP_ATTEMPTS;
 
@@ -3169,10 +3169,11 @@ static void startTunReadThread(n2n_edge_t *eee)
 
 /* ***************************************************** */
 
-/** Build DNS query packet for TXT record.
+/** Build DNS query packet for TXT or A/AAAA record.
+ *  qtype: 1=A, 28=AAAA, 16=TXT
  *  Returns the length of the query packet.
  */
-static int build_dns_txt_query(const char *domain, uint8_t *buf, size_t buf_size, uint16_t txn_id) {
+static int build_dns_query(const char *domain, uint8_t *buf, size_t buf_size, uint16_t txn_id, uint16_t qtype) {
     if (!domain || !buf || buf_size < 256)
         return -1;
 
@@ -3201,102 +3202,47 @@ static int build_dns_txt_query(const char *domain, uint8_t *buf, size_t buf_size
     }
     buf[pos++] = 0x00;  /* End of domain name */
 
-    /* Query type: TXT (16) */
-    buf[pos++] = 0x00; buf[pos++] = 0x10;
+    /* Query type */
+    buf[pos++] = (qtype >> 8) & 0xFF;
+    buf[pos++] = qtype & 0xFF;
     /* Query class: IN (1) */
     buf[pos++] = 0x00; buf[pos++] = 0x01;
 
     return (int)pos;
 }
 
-/** Parse DNS response for TXT record.
+/** Query DNS record for supernode address using raw UDP.
+ *  qtype: 1=A, 28=AAAA, 16=TXT
  *  Returns 0 on success, -1 on failure.
+ *  For TXT: result contains host:port format.
+ *  For A/AAAA: result contains IP address string.
  */
-static int parse_dns_txt_response(const uint8_t *buf, size_t buf_len, uint16_t txn_id,
-                                   char *txt_result, size_t result_size) {
-    if (!buf || buf_len < 12 || !txt_result)
+static int query_dns_record(const char *domain, uint16_t qtype, char *result, size_t result_size) {
+    if (!domain || !result || result_size == 0)
         return -1;
 
-    /* Check transaction ID */
-    if (buf[0] != ((txn_id >> 8) & 0xFF) || buf[1] != (txn_id & 0xFF))
-        return -1;
-
-    /* Check flags: must be a response (QR=1) and no error (RCODE=0) */
-    if (!(buf[2] & 0x80)) return -1;  /* Not a response */
-    if (buf[3] & 0x0F) return -1;      /* Error in response */
-
-    /* Get answer count */
-    uint16_t ancount = (buf[6] << 8) | buf[7];
-    if (ancount == 0) return -1;
-
-    /* Skip header (12 bytes) and question section */
-    size_t pos = 12;
-    /* Skip question name */
-    while (pos < buf_len && buf[pos] != 0) {
-        if (buf[pos] & 0xC0) { pos += 2; break; }  /* Compression pointer */
-        pos += buf[pos] + 1;
-    }
-    if (pos < buf_len && buf[pos] == 0) pos++;
-    pos += 4;  /* Skip QTYPE and QCLASS */
-
-    /* Parse answers */
-    for (uint16_t i = 0; i < ancount && pos < buf_len; i++) {
-        /* Skip name (may be compressed) */
-        if (buf[pos] & 0xC0) {
-            pos += 2;
-        } else {
-            while (pos < buf_len && buf[pos] != 0) {
-                pos += buf[pos] + 1;
-            }
-            if (pos < buf_len) pos++;
-        }
-
-        if (pos + 10 > buf_len) return -1;
-
-        uint16_t rtype = (buf[pos] << 8) | buf[pos+1];
-        uint16_t rdlength = (buf[pos+8] << 8) | buf[pos+9];
-        pos += 10;  /* Skip TYPE, CLASS, TTL, RDLENGTH */
-
-        if (rtype == 0x10) {  /* TXT record */
-            if (pos + rdlength > buf_len) return -1;
-            /* TXT RDATA: first byte is length of the text string */
-            uint8_t txt_len = buf[pos];
-            if (txt_len > 0 && txt_len < rdlength && txt_len < result_size) {
-                memcpy(txt_result, buf + pos + 1, txt_len);
-                txt_result[txt_len] = '\0';
-                return 0;
-            }
-        }
-        pos += rdlength;
+    static char cached_domain[256] = "";
+    static char cached_result[256] = "";
+    static uint16_t cached_qtype = 0;
+    static time_t cache_time = 0;
+    time_t now = time(NULL);
+    
+    if (strcmp(domain, cached_domain) == 0 && cached_qtype == qtype && (now - cache_time) < 5 && cached_result[0] != '\0') {
+        strncpy(result, cached_result, result_size - 1);
+        result[result_size - 1] = '\0';
+        return 0;
     }
 
-    return -1;
-}
-
-/** Query DNS TXT record for supernode address using raw UDP.
- *  Returns 0 on success, -1 on failure.
- *  On success, txt_result contains the supernode address (host:port format).
- */
-static int query_txt_record(const char *domain, char *txt_result, size_t result_size) {
-    if (!domain || !txt_result || result_size == 0)
-        return -1;
-
-    traceEvent(TRACE_NORMAL, "Querying TXT record for %s", domain);
-
-    /* Public DNS servers to try */
     const char *dns_servers[] = {"8.8.8.8", "119.29.29.29", "1.1.1.1", "223.5.5.5"};
     uint8_t query_buf[256];
     uint8_t response_buf[1024];
-    uint16_t txn_id = (uint16_t)(time(NULL) & 0xFFFF);
+    uint16_t txn_id = (uint16_t)(now & 0xFFFF);
 
-    /* Build DNS query packet */
-    int query_len = build_dns_txt_query(domain, query_buf, sizeof(query_buf), txn_id);
+    int query_len = build_dns_query(domain, query_buf, sizeof(query_buf), txn_id, qtype);
     if (query_len < 0) {
-        traceEvent(TRACE_WARNING, "Failed to build DNS query for %s", domain);
         return -1;
     }
 
-    /* Try each DNS server */
     for (int i = 0; i < 4; i++) {
         struct sockaddr_in dns_addr;
         memset(&dns_addr, 0, sizeof(dns_addr));
@@ -3309,45 +3255,101 @@ static int query_txt_record(const char *domain, char *txt_result, size_t result_
         inet_pton(AF_INET, dns_servers[i], &dns_addr.sin_addr);
 #endif
 
-        /* Create UDP socket */
         SOCKET sock = socket(AF_INET, SOCK_DGRAM, 0);
         if (sock < 0) continue;
 
-        /* Set socket timeout */
 #ifdef _WIN32
-        DWORD timeout = 5000;  /* 5 seconds */
+        DWORD timeout = 3000;
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
 #else
         struct timeval tv;
-        tv.tv_sec = 5;
+        tv.tv_sec = 3;
         tv.tv_usec = 0;
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 #endif
 
-        /* Send DNS query */
         if (sendto(sock, (char*)query_buf, query_len, 0,
                    (struct sockaddr*)&dns_addr, sizeof(dns_addr)) < 0) {
             closesocket(sock);
             continue;
         }
 
-        /* Receive DNS response */
         socklen_t addr_len = sizeof(dns_addr);
         int resp_len = recvfrom(sock, (char*)response_buf, sizeof(response_buf), 0,
                                  (struct sockaddr*)&dns_addr, &addr_len);
         closesocket(sock);
 
         if (resp_len > 0) {
-            /* Parse DNS response */
-            if (parse_dns_txt_response(response_buf, resp_len, txn_id, txt_result, result_size) == 0) {
-                traceEvent(TRACE_NORMAL, "TXT record found: %s", txt_result);
-                return 0;
+            if (response_buf[0] != ((txn_id >> 8) & 0xFF) || response_buf[1] != (txn_id & 0xFF))
+                continue;
+            if (!(response_buf[2] & 0x80) || (response_buf[3] & 0x0F))
+                continue;
+
+            uint16_t ancount = (response_buf[6] << 8) | response_buf[7];
+            if (ancount == 0) continue;
+
+            size_t pos = 12;
+            while (pos < (size_t)resp_len && response_buf[pos] != 0) {
+                if (response_buf[pos] & 0xC0) { pos += 2; break; }
+                pos += response_buf[pos] + 1;
+            }
+            if (pos < (size_t)resp_len && response_buf[pos] == 0) pos++;
+            pos += 4;
+
+            for (uint16_t j = 0; j < ancount && pos < (size_t)resp_len; j++) {
+                if (response_buf[pos] & 0xC0) {
+                    pos += 2;
+                } else {
+                    while (pos < (size_t)resp_len && response_buf[pos] != 0) {
+                        pos += response_buf[pos] + 1;
+                    }
+                    if (pos < (size_t)resp_len) pos++;
+                }
+
+                if (pos + 10 > (size_t)resp_len) break;
+
+                uint16_t rtype = (response_buf[pos] << 8) | response_buf[pos+1];
+                uint16_t rdlength = (response_buf[pos+8] << 8) | response_buf[pos+9];
+                pos += 10;
+
+                if (rtype == qtype) {
+                    if (qtype == 0x10) {
+                        uint8_t txt_len = response_buf[pos];
+                        if (txt_len > 0 && txt_len < rdlength && txt_len < result_size) {
+                            memcpy(result, response_buf + pos + 1, txt_len);
+                            result[txt_len] = '\0';
+                            strncpy(cached_domain, domain, sizeof(cached_domain) - 1);
+                            strncpy(cached_result, result, sizeof(cached_result) - 1);
+                            cached_qtype = qtype;
+                            cache_time = now;
+                            return 0;
+                        }
+                    } else if (qtype == 0x01 && rdlength == 4) {
+                        inet_ntop(AF_INET, response_buf + pos, result, result_size);
+                        strncpy(cached_domain, domain, sizeof(cached_domain) - 1);
+                        strncpy(cached_result, result, sizeof(cached_result) - 1);
+                        cached_qtype = qtype;
+                        cache_time = now;
+                        return 0;
+                    } else if (qtype == 0x1C && rdlength == 16) {
+                        inet_ntop(AF_INET6, response_buf + pos, result, result_size);
+                        strncpy(cached_domain, domain, sizeof(cached_domain) - 1);
+                        strncpy(cached_result, result, sizeof(cached_result) - 1);
+                        cached_qtype = qtype;
+                        cache_time = now;
+                        return 0;
+                    }
+                }
+                pos += rdlength;
             }
         }
     }
 
-    traceEvent(TRACE_WARNING, "No valid TXT record found for %s", domain);
     return -1;
+}
+
+static int query_txt_record(const char *domain, char *txt_result, size_t result_size) {
+    return query_dns_record(domain, 0x10, txt_result, result_size);
 }
 
 /* ***************************************************** */
@@ -3367,7 +3369,6 @@ static int supernode2addr(n2n_sock_t * sn, int af, const n2n_sn_name_t addrIn) {
     len = strlen(addr);
 
     if ( len > 0) {
-        int ip_error = 0;
         char *supernode_port = NULL;
 
         if (addr[len - 1] != ']') {
@@ -3395,55 +3396,34 @@ static int supernode2addr(n2n_sock_t * sn, int af, const n2n_sn_name_t addrIn) {
         if ( addr[0] == '[' ) {
             /* cut leading and trailing brackets */
             addr[strlen(addr) - 1] = '\0';
-            if ((err = inet_pton(AF_INET6, addr + 1, &sn->addr.v6)) != 1) {
-                ip_error = errno;
-            } else {
+            err = inet_pton(AF_INET6, addr + 1, &sn->addr.v6);
+            if (err == 1) {
                 sn->family = AF_INET6;
             }
         } else {
-            if ((err = inet_pton(AF_INET, addr, &sn->addr.v4)) != 1) {
-                ip_error = errno;
-            } else {
+            err = inet_pton(AF_INET, addr, &sn->addr.v4);
+            if (err == 1) {
                 sn->family = AF_INET;
             }
         }
 
         /* fallback to resolving as a DNS name */
         if (err != 1) {
-            const struct addrinfo aihints = { 0, af, SOCK_DGRAM, 0, 0, NULL, NULL, NULL };
-            struct addrinfo * ainfo = NULL;
-
-            err = getaddrinfo( addr, NULL, &aihints, &ainfo );
-            if( 0 == err ) {
-                /* ainfo is the head of a linked list if non-NULL. */
-                if (ainfo) {
-                    if (PF_INET == ainfo->ai_family) {
-                        struct sockaddr_in* saddr = (struct sockaddr_in*) ainfo->ai_addr;
-                        memcpy( sn->addr.v4, &(saddr->sin_addr), IPV4_SIZE );
-                        sn->family = AF_INET;
-                    } else if (PF_INET6 == ainfo->ai_family) {
-                        struct sockaddr_in6 * saddr = (struct sockaddr_in6*) ainfo->ai_addr;
-                        memcpy( sn->addr.v6, &(saddr->sin6_addr), IPV6_SIZE );
-                        sn->family = AF_INET6;
-                    }
+            char ip_str[INET6_ADDRSTRLEN];
+            uint16_t qtype = (af == AF_INET6) ? 0x1C : 0x01;
+            
+            if (query_dns_record(addr, qtype, ip_str, sizeof(ip_str)) == 0) {
+                if (qtype == 0x01) {
+                    inet_pton(AF_INET, ip_str, &sn->addr.v4);
+                    sn->family = AF_INET;
                 } else {
-                    traceEvent(TRACE_WARNING, "Failed to resolve supernode IP address for %s", addr);
+                    inet_pton(AF_INET6, ip_str, &sn->addr.v6);
+                    sn->family = AF_INET6;
                 }
-
-                freeaddrinfo(ainfo); /* free everything allocated by getaddrinfo(). */
-                ainfo = NULL;
-
                 err = 0;
             } else {
-#if _WIN32
-                traceEvent(TRACE_WARNING, "Failed to resolve supernode host %s: %ls", addr, gai_strerror(err));
-#else
-                traceEvent(TRACE_WARNING, "Failed to resolve supernode host %s: %s", addr, gai_strerror(err));
-#endif
+                traceEvent(TRACE_WARNING, "Failed to resolve supernode host %s", addr);
                 err = -1;
-                if (ip_error != 0) {
-                    traceEvent(TRACE_DEBUG, "Failed to parse supernode as a numeric address %s: %s", addr, strerror(ip_error));
-                }
             }
         } else {
             err = 0;
