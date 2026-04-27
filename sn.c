@@ -21,6 +21,7 @@
 #else
 #include <sys/select.h>
 #include <arpa/inet.h>
+#include <netinet/in.h>
 #define SOCKET_INVALID -1
 #define CLOSE_SOCKET(s) close(s)
 #endif
@@ -933,6 +934,37 @@ static int try_forward( n2n_sn_t * sss,
 }
 
 
+/* Hide community name for privacy:
+ * - 1 char: "*" 
+ * - 2-7 chars: show first half + "*"
+ * - 8+ chars: show first 4 + "*"
+ */
+static void hide_community_name(char *dst, const char *src, size_t dst_size) {
+    size_t len = strlen(src);
+    size_t show_len;
+    
+    if (len == 0) {
+        dst[0] = '\0';
+        return;
+    }
+    
+    if (len == 1) {
+        show_len = 0;
+    } else if (len < 8) {
+        show_len = len / 2;
+    } else {
+        show_len = 4;
+    }
+    
+    if (show_len >= dst_size) show_len = dst_size - 2;
+    
+    if (show_len > 0) {
+        memcpy(dst, src, show_len);
+    }
+    dst[show_len] = '*';
+    dst[show_len + 1] = '\0';
+}
+
 /** Try and broadcast a message to all edges in the community.
  *
  *  This will send the exact same datagram to zero or more edges registered to
@@ -956,6 +988,25 @@ static int process_mgmt( n2n_sn_t * sss,
     uint32_t num_edges = 0;
 
     traceEvent( TRACE_DEBUG, "process_mgmt" );
+
+    /* Only allow localhost connections for security */
+    int is_localhost = 0;
+    if (sender_sock->sa_family == AF_INET) {
+        uint32_t addr = ((struct sockaddr_in*)sender_sock)->sin_addr.s_addr;
+        is_localhost = (addr == htonl(INADDR_LOOPBACK)) || (addr == 0);
+    } else if (sender_sock->sa_family == AF_INET6) {
+        struct in6_addr *a6 = &((struct sockaddr_in6*)sender_sock)->sin6_addr;
+        is_localhost = (memcmp(a6, &in6addr_loopback, sizeof(*a6)) == 0);
+    }
+    if (!is_localhost) {
+        char tmp[INET6_ADDRSTRLEN] = "unknown";
+        if (sender_sock->sa_family == AF_INET)
+            inet_ntop(AF_INET, &((struct sockaddr_in*)sender_sock)->sin_addr, tmp, sizeof(tmp));
+        else if (sender_sock->sa_family == AF_INET6)
+            inet_ntop(AF_INET6, &((struct sockaddr_in6*)sender_sock)->sin6_addr, tmp, sizeof(tmp));
+        traceEvent(TRACE_WARNING, "mgmt request from non-localhost %s rejected", tmp);
+        return -1;
+    }
 
     /* Send header */
     ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
@@ -994,6 +1045,9 @@ static int process_mgmt( n2n_sn_t * sss,
     uint32_t displayed_edges = 0;
     for (int i = 0; i < num_communities; i++) {
         /* Community name line with traffic stats on same line */
+        char hidden_name[64];
+        hide_community_name(hidden_name, (char*)communities[i], sizeof(hidden_name));
+        
         if (sss->traffic_stats_enabled) {
             struct community_stats *cs = sss->comm_stats;
             while (cs && memcmp(cs->community_name, communities[i], sizeof(n2n_community_t)) != 0)
@@ -1005,12 +1059,12 @@ static int process_mgmt( n2n_sn_t * sss,
                 const char *arrow = (cs->instant_Bps > 0) ? "--->" : "    ";
                 ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
                                    "%-57s  %s %-7.1f  %-7.1f  %-10.1f\n",
-                                   communities[i], arrow, kbps, gb_24h, gb_30d);
+                                   hidden_name, arrow, kbps, gb_24h, gb_30d);
             } else {
-                ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE, "%s\n", communities[i]);
+                ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE, "%s\n", hidden_name);
             }
         } else {
-            ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE, "%s\n", communities[i]);
+            ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE, "%s\n", hidden_name);
         }
         r = sendto(sss->mgmt_sock, resbuf, ressize, 0, sender_sock, sender_sock_len);
         if (r <= 0) return -1;
@@ -1087,6 +1141,8 @@ static int process_mgmt( n2n_sn_t * sss,
                 time_t idle = now - cs->last_active;
                 if (idle < 86400) {
                     /* Offline < 24h: show individually */
+                    char hidden_name[64];
+                    hide_community_name(hidden_name, (char*)cs->community_name, sizeof(hidden_name));
                     if (cs->total_30d > 0) {
                         double kbps  = cs->instant_Bps / 1024.0;
                         double gb24h = cs->last_24h_bytes / (1024.0*1024.0*1024.0);
@@ -1094,10 +1150,10 @@ static int process_mgmt( n2n_sn_t * sss,
                         const char *arrow = (cs->instant_Bps > 0) ? "--->" : "    ";
                         ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
                                            "%-57s  %s %-7.1f  %-7.1f  %-10.1f\n",
-                                           cs->community_name, arrow, kbps, gb24h, gb30d);
+                                           hidden_name, arrow, kbps, gb24h, gb30d);
                     } else {
                         ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE, "%s\n",
-                                           cs->community_name);
+                                           hidden_name);
                     }
                     r = sendto(sss->mgmt_sock, resbuf, ressize, 0, sender_sock, sender_sock_len);
                     if (r <= 0) return -1;
