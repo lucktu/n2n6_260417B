@@ -3537,6 +3537,8 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
 
     while (supernode2addr( &(eee.supernode), eee.sn_af, eee.sn_ip_array[eee.sn_idx] ) != 0) {
         // could not resolve IP, sleep and try again
+        if (!g_edge_running) break;
+        traceEvent(TRACE_WARNING, "Failed to resolve supernode, retrying in 5 seconds...");
 #ifdef _WIN32
         Sleep(5000);
 #else
