@@ -35,6 +35,17 @@
 
 #ifdef _WIN32
 #include <iphlpapi.h>
+#include <windns.h>
+#pragma comment(lib, "dnsapi.lib")
+/* Interface types for filtering virtual interfaces */
+#ifndef IF_TYPE_PPP
+#define IF_TYPE_PPP 23
+#endif
+#ifndef IF_TYPE_TUNNEL
+#define IF_TYPE_TUNNEL 131
+#endif
+#else
+#include <resolv.h>
 #endif
 
 /* reallocarray compatibility for older glibc versions */
@@ -169,6 +180,10 @@ struct n2n_edge
 
     /* UPnP/NAT-PMP */
     uint16_t            upnp_mapped_port;       /**< External port mapped via UPnP/NAT-PMP, 0 if none */
+
+    /* Track last resolved supernode address for detecting changes */
+    n2n_sock_t          last_resolved_supernode; /**< Last resolved supernode address */
+    time_t              last_resolve_check;      /**< Last time we checked supernode resolution */
 
     /* Statistics */
     size_t              tx_p2p;
@@ -449,6 +464,8 @@ static int edge_init(n2n_edge_t * eee)
     eee->sup_attempts = N2N_EDGE_SUP_ATTEMPTS;
     eee->sn_af = AF_UNSPEC;
     memset(&eee->my_public_sock, 0, sizeof(n2n_sock_t));
+    memset(&eee->last_resolved_supernode, 0, sizeof(n2n_sock_t));
+    eee->last_resolve_check = 0;
 
     if(lzo_init() != LZO_E_OK)
     {
@@ -588,7 +605,9 @@ static void help() {
     printf("\n");
     printf("                         : B5 = Speck(-k). '-B1' can also be used as '-B 1' (default: twofish)\n");
     printf("-k <encrypt key>         | Encryption key (ASCII, max 32) - also N2N_KEY=<encrypt key>.\n");
-    printf("-l <supernode host:port> | Supernode IP:port (default: ouno.eu.org:10084)\n");
+    printf("-l <supernode host:port> | Supernode address Formats (default: ouno.eu.org:10084):\n");
+    printf("                         : host:port  - Direct address (e.g. ouno.eu.org:10084)\n");
+    printf("                         : host       - Query DNS TXT record for address (e.g. n2n.example.com)\n");
     printf("-4/-6                    | Resolve supernode DNS name as IPv4 or IPv6 (default: auto)\n");
     printf("-p <local port>          | Fixed local UDP port.\n");
 #ifndef _WIN32
@@ -1571,22 +1590,23 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
         traceEvent(TRACE_WARNING, "Supernode not responding - moving to %u of %u",
                    (unsigned int)eee->sn_idx, (unsigned int)eee->sn_num);
         eee->sup_attempts = N2N_EDGE_SUP_ATTEMPTS;
+        
+        /* Re-resolve supernode address when switching to a different supernode */
+        if(eee->re_resolve_supernode_ip)
+        {
+            supernode2addr(&(eee->supernode), eee->sn_af, eee->sn_ip_array[eee->sn_idx]);
+            
+            /* Clear alternate address - it will be resolved naturally if domain has both A and AAAA */
+            memset(&eee->supernode_alt, 0, sizeof(n2n_sock_t));
+        }
     }
     else
     {
         --(eee->sup_attempts);
     }
 
-    if(eee->re_resolve_supernode_ip)
-    {
-        supernode2addr(&(eee->supernode), eee->sn_af, eee->sn_ip_array[eee->sn_idx]);
-        memset(&eee->supernode_alt, 0, sizeof(n2n_sock_t));
-        {
-            int alt_af = (eee->supernode.family == AF_INET6) ? AF_INET : AF_INET6;
-            if (supernode2addr(&eee->supernode_alt, alt_af, eee->sn_ip_array[eee->sn_idx]) != 0)
-                memset(&eee->supernode_alt, 0, sizeof(n2n_sock_t));
-        }
-    }
+    /* Note: Domain re-resolution during normal registration is handled by
+     * check_supernode_domain_and_update() which runs every 300 seconds when idle. */
 
     send_register_super( eee, &(eee->supernode) );
     eee->sn_wait=1;
@@ -2886,6 +2906,297 @@ static void startTunReadThread(n2n_edge_t *eee)
 
 /* ***************************************************** */
 
+/** Build DNS query packet for TXT record.
+ *  Returns the length of the query packet.
+ */
+static int build_dns_txt_query(const char *domain, uint8_t *buf, size_t buf_size, uint16_t txn_id) {
+    if (!domain || !buf || buf_size < 256)
+        return -1;
+    /* DNS header: 12 bytes */
+    buf[0] = (txn_id >> 8) & 0xFF;  /* Transaction ID high */
+    buf[1] = txn_id & 0xFF;         /* Transaction ID low */
+    buf[2] = 0x01;  /* Flags: Recursion Desired */
+    buf[3] = 0x00;
+    buf[4] = 0x00; buf[5] = 0x01;  /* Questions: 1 */
+    buf[6] = 0x00; buf[7] = 0x00;  /* Answer RRs: 0 */
+    buf[8] = 0x00; buf[9] = 0x00;  /* Authority RRs: 0 */
+    buf[10] = 0x00; buf[11] = 0x00; /* Additional RRs: 0 */
+    /* Build domain name in DNS format (length-prefixed labels) */
+    size_t pos = 12;
+    const char *p = domain;
+    while (*p && pos < buf_size - 20) {
+        const char *dot = strchr(p, '.');
+        size_t label_len = dot ? (size_t)(dot - p) : strlen(p);
+        if (label_len > 63 || label_len == 0) return -1;
+        buf[pos++] = (uint8_t)label_len;
+        memcpy(buf + pos, p, label_len);
+        pos += label_len;
+        p = dot ? dot + 1 : p + label_len;
+        if (!dot) break;
+    }
+    buf[pos++] = 0x00;  /* End of domain name */
+    /* Query type: TXT (16) */
+    buf[pos++] = 0x00; buf[pos++] = 0x10;
+    /* Query class: IN (1) */
+    buf[pos++] = 0x00; buf[pos++] = 0x01;
+    return (int)pos;
+}
+/** Parse DNS response for TXT record.
+ *  Returns 0 on success, -1 on failure.
+ */
+static int parse_dns_txt_response(const uint8_t *buf, size_t buf_len, uint16_t txn_id,
+                                   char *txt_result, size_t result_size) {
+    if (!buf || buf_len < 12 || !txt_result)
+        return -1;
+    /* Check transaction ID */
+    if (buf[0] != ((txn_id >> 8) & 0xFF) || buf[1] != (txn_id & 0xFF))
+        return -1;
+    /* Check flags: must be a response (QR=1) and no error (RCODE=0) */
+    if (!(buf[2] & 0x80)) return -1;  /* Not a response */
+    if (buf[3] & 0x0F) return -1;      /* Error in response */
+    /* Get answer count */
+    uint16_t ancount = (buf[6] << 8) | buf[7];
+    if (ancount == 0) return -1;
+    /* Skip header (12 bytes) and question section */
+    size_t pos = 12;
+    /* Skip question name */
+    while (pos < buf_len && buf[pos] != 0) {
+        if (buf[pos] & 0xC0) { pos += 2; break; }  /* Compression pointer */
+        pos += buf[pos] + 1;
+    }
+    if (pos < buf_len && buf[pos] == 0) pos++;
+    pos += 4;  /* Skip QTYPE and QCLASS */
+    /* Parse answers */
+    for (uint16_t i = 0; i < ancount && pos < buf_len; i++) {
+        /* Skip name (may be compressed) */
+        if (buf[pos] & 0xC0) {
+            pos += 2;
+        } else {
+            while (pos < buf_len && buf[pos] != 0) {
+                pos += buf[pos] + 1;
+            }
+            if (pos < buf_len) pos++;
+        }
+        if (pos + 10 > buf_len) return -1;
+        uint16_t rtype = (buf[pos] << 8) | buf[pos+1];
+        uint16_t rdlength = (buf[pos+8] << 8) | buf[pos+9];
+        pos += 10;  /* Skip TYPE, CLASS, TTL, RDLENGTH */
+        if (rtype == 0x10) {  /* TXT record */
+            if (pos + rdlength > buf_len) return -1;
+            /* TXT RDATA: first byte is length of the text string */
+            uint8_t txt_len = buf[pos];
+            if (txt_len > 0 && txt_len < rdlength && txt_len < result_size) {
+                memcpy(txt_result, buf + pos + 1, txt_len);
+                txt_result[txt_len] = '\0';
+                return 0;
+            }
+        }
+        pos += rdlength;
+    }
+    return -1;
+}
+/** Query DNS TXT record for supernode address using raw UDP.
+ *  Returns 0 on success, -1 on failure.
+ *  On success, txt_result contains the supernode address (host:port format).
+ */
+static int query_txt_record(const char *domain, char *txt_result, size_t result_size) {
+    if (!domain || !txt_result || result_size == 0)
+        return -1;
+    traceEvent(TRACE_NORMAL, "Querying TXT record for %s", domain);
+    /* Public DNS servers to try */
+    const char *dns_servers[] = {"8.8.8.8", "119.29.29.29", "1.1.1.1", "223.5.5.5"};
+    uint8_t query_buf[256];
+    uint8_t response_buf[1024];
+    uint16_t txn_id = (uint16_t)(time(NULL) & 0xFFFF);
+    /* Build DNS query packet */
+    int query_len = build_dns_txt_query(domain, query_buf, sizeof(query_buf), txn_id);
+    if (query_len < 0) {
+        traceEvent(TRACE_WARNING, "Failed to build DNS query for %s", domain);
+        return -1;
+    }
+    /* Try each DNS server */
+    for (int i = 0; i < 4; i++) {
+        struct sockaddr_in dns_addr;
+        memset(&dns_addr, 0, sizeof(dns_addr));
+        dns_addr.sin_family = AF_INET;
+        dns_addr.sin_port = htons(53);
+        
+#ifdef _WIN32
+        dns_addr.sin_addr.s_addr = inet_addr(dns_servers[i]);
+#else
+        inet_pton(AF_INET, dns_servers[i], &dns_addr.sin_addr);
+#endif
+        /* Create UDP socket */
+        SOCKET sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock < 0) continue;
+        /* Set socket timeout */
+#ifdef _WIN32
+        DWORD timeout = 5000;  /* 5 seconds */
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+#else
+        struct timeval tv;
+        tv.tv_sec = 5;
+        tv.tv_usec = 0;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+        /* Send DNS query */
+        if (sendto(sock, (char*)query_buf, query_len, 0,
+                   (struct sockaddr*)&dns_addr, sizeof(dns_addr)) < 0) {
+            closesocket(sock);
+            continue;
+        }
+        /* Receive DNS response */
+        socklen_t addr_len = sizeof(dns_addr);
+        int resp_len = recvfrom(sock, (char*)response_buf, sizeof(response_buf), 0,
+                                 (struct sockaddr*)&dns_addr, &addr_len);
+        closesocket(sock);
+        if (resp_len > 0) {
+            /* Parse DNS response */
+            if (parse_dns_txt_response(response_buf, resp_len, txn_id, txt_result, result_size) == 0) {
+                traceEvent(TRACE_NORMAL, "TXT record found: %s", txt_result);
+                return 0;
+            }
+        }
+    }
+    traceEvent(TRACE_WARNING, "No valid TXT record found for %s", domain);
+    return -1;
+}
+
+/* ***************************************************** */
+
+/** Query DNS A or AAAA record using raw UDP.
+ *  @param domain Domain name to query
+ *  @param ip_result Buffer to store result IP address string
+ *  @param result_size Size of result buffer
+ *  @param query_ipv6 1 for AAAA (IPv6), 0 for A (IPv4)
+ *  Returns 0 on success, -1 on failure.
+ */
+static int query_dns_record(const char *domain, char *ip_result, size_t result_size, int query_ipv6) {
+    if (!domain || !ip_result || result_size < (query_ipv6 ? 40 : 16))
+        return -1;
+    
+    const char *dns_servers[] = {"8.8.8.8", "119.29.29.29", "1.1.1.1", "223.5.5.5"};
+    uint8_t query_buf[256];
+    uint8_t response_buf[1024];
+    uint16_t txn_id = (uint16_t)(time(NULL) & 0xFFFF) + query_ipv6;
+    uint16_t qtype = query_ipv6 ? 0x1C : 0x01;  /* AAAA=28, A=1 */
+    uint16_t expected_rdlen = query_ipv6 ? 16 : 4;
+    
+    /* Build DNS query */
+    query_buf[0] = (txn_id >> 8) & 0xFF;
+    query_buf[1] = txn_id & 0xFF;
+    query_buf[2] = 0x01; query_buf[3] = 0x00;
+    query_buf[4] = 0x00; query_buf[5] = 0x01;
+    query_buf[6] = 0x00; query_buf[7] = 0x00;
+    query_buf[8] = 0x00; query_buf[9] = 0x00;
+    query_buf[10] = 0x00; query_buf[11] = 0x00;
+    
+    size_t pos = 12;
+    const char *p = domain;
+    while (*p && pos < sizeof(query_buf) - 20) {
+        const char *dot = strchr(p, '.');
+        size_t label_len = dot ? (size_t)(dot - p) : strlen(p);
+        if (label_len > 63 || label_len == 0) return -1;
+        query_buf[pos++] = (uint8_t)label_len;
+        memcpy(query_buf + pos, p, label_len);
+        pos += label_len;
+        p = dot ? dot + 1 : p + label_len;
+        if (!dot) break;
+    }
+    query_buf[pos++] = 0x00;
+    query_buf[pos++] = (qtype >> 8) & 0xFF; query_buf[pos++] = qtype & 0xFF;
+    query_buf[pos++] = 0x00; query_buf[pos++] = 0x01;
+    int query_len = (int)pos;
+    
+    /* Try each DNS server */
+    for (int i = 0; i < 4; i++) {
+        struct sockaddr_in dns_addr;
+        memset(&dns_addr, 0, sizeof(dns_addr));
+        dns_addr.sin_family = AF_INET;
+        dns_addr.sin_port = htons(53);
+#ifdef _WIN32
+        dns_addr.sin_addr.s_addr = inet_addr(dns_servers[i]);
+#else
+        inet_pton(AF_INET, dns_servers[i], &dns_addr.sin_addr);
+#endif
+        
+        SOCKET sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock < 0) continue;
+        
+#ifdef _WIN32
+        DWORD timeout = 5000;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+#else
+        struct timeval tv = {5, 0};
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+        
+        if (sendto(sock, (char*)query_buf, query_len, 0,
+                   (struct sockaddr*)&dns_addr, sizeof(dns_addr)) < 0) {
+            closesocket(sock);
+            continue;
+        }
+        
+        socklen_t addr_len = sizeof(dns_addr);
+        int resp_len = recvfrom(sock, (char*)response_buf, sizeof(response_buf), 0,
+                                 (struct sockaddr*)&dns_addr, &addr_len);
+        closesocket(sock);
+        
+        if (resp_len > 12 && 
+            response_buf[0] == ((txn_id >> 8) & 0xFF) && 
+            response_buf[1] == (txn_id & 0xFF) &&
+            (response_buf[2] & 0x80) && !(response_buf[3] & 0x0F)) {
+            
+            uint16_t ancount = (response_buf[6] << 8) | response_buf[7];
+            if (ancount == 0) continue;
+            
+            /* Skip question */
+            pos = 12;
+            while (pos < (size_t)resp_len && response_buf[pos] != 0) {
+                if ((response_buf[pos] & 0xC0) == 0xC0) { pos += 2; break; }
+                pos += response_buf[pos] + 1;
+            }
+            if (response_buf[pos] == 0) pos++;
+            pos += 4;
+            
+            /* Parse answers */
+            for (int j = 0; j < ancount && pos < (size_t)resp_len; j++) {
+                if ((response_buf[pos] & 0xC0) == 0xC0) {
+                    pos += 2;
+                } else {
+                    while (pos < (size_t)resp_len && response_buf[pos] != 0)
+                        pos += response_buf[pos] + 1;
+                    pos++;
+                }
+                
+                if (pos + 10 > (size_t)resp_len) break;
+                uint16_t rtype = (response_buf[pos] << 8) | response_buf[pos+1];
+                uint16_t rdlength = (response_buf[pos+8] << 8) | response_buf[pos+9];
+                pos += 10;
+                
+                if (rtype == qtype && rdlength == expected_rdlen && pos + rdlength <= (size_t)resp_len) {
+                    if (query_ipv6) {
+                        snprintf(ip_result, result_size, 
+                                "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x",
+                                response_buf[pos], response_buf[pos+1], response_buf[pos+2], response_buf[pos+3],
+                                response_buf[pos+4], response_buf[pos+5], response_buf[pos+6], response_buf[pos+7],
+                                response_buf[pos+8], response_buf[pos+9], response_buf[pos+10], response_buf[pos+11],
+                                response_buf[pos+12], response_buf[pos+13], response_buf[pos+14], response_buf[pos+15]);
+                    } else {
+                        snprintf(ip_result, result_size, "%u.%u.%u.%u",
+                                response_buf[pos], response_buf[pos+1], response_buf[pos+2], response_buf[pos+3]);
+                    }
+                    return 0;
+                }
+                pos += rdlength;
+            }
+        }
+    }
+    return -1;
+}
+
+/* ***************************************************** */
+
 /** Resolve the supernode IP address.
  *
  *  REVISIT: This is a really bad idea. The edge will block completely while the
@@ -2909,8 +3220,18 @@ static int supernode2addr(n2n_sock_t * sn, int af, const n2n_sn_name_t addrIn) {
             if ( supernode_port ) {
                 sn->port = atoi(supernode_port + 1);
                 *(supernode_port) = '\0';
-            } else
-                sn->port = SUPERNODE_PORT;
+            } else {
+                /* No port: query TXT record for supernode address */
+                query_txt_record(addr, addr, N2N_EDGE_SN_HOST_SIZE);
+                len = strlen(addr);
+                supernode_port = strrchr(addr, ':');
+                if (supernode_port) {
+                    sn->port = atoi(supernode_port + 1);
+                    *supernode_port = '\0';
+                } else {
+                    sn->port = SUPERNODE_PORT;
+                }
+            }
         }
         if (sn->port == 0)
             sn->port = SUPERNODE_PORT;
@@ -2934,19 +3255,30 @@ static int supernode2addr(n2n_sock_t * sn, int af, const n2n_sn_name_t addrIn) {
 
         /* fallback to resolving as a DNS name */
         if (err != 1) {
-            const struct addrinfo aihints = { 0, af, SOCK_DGRAM, 0, 0, NULL, NULL, NULL };
+            /* For domain names, use AF_UNSPEC to get any available address (don't force address family) */
+            const struct addrinfo aihints = { 0, AF_UNSPEC, SOCK_DGRAM, 0, 0, NULL, NULL, NULL };
             struct addrinfo * ainfo = NULL;
 
             err = getaddrinfo( addr, NULL, &aihints, &ainfo );
             if( 0 == err ) {
-                /* ainfo is the head of a linked list if non-NULL. */
                 if (ainfo) {
-                    if (PF_INET == ainfo->ai_family) {
-                        struct sockaddr_in* saddr = (struct sockaddr_in*) ainfo->ai_addr;
+                    struct addrinfo *selected = ainfo;
+                    
+                    /* Prefer user-specified address family, otherwise prefer IPv4 for compatibility */
+                    int prefer_af = (af != AF_UNSPEC) ? af : AF_INET;
+                    for (struct addrinfo *scan = ainfo; scan; scan = scan->ai_next) {
+                        if (scan->ai_family == prefer_af) {
+                            selected = scan;
+                            break;
+                        }
+                    }
+                    
+                    if (PF_INET == selected->ai_family) {
+                        struct sockaddr_in* saddr = (struct sockaddr_in*) selected->ai_addr;
                         memcpy( sn->addr.v4, &(saddr->sin_addr), IPV4_SIZE );
                         sn->family = AF_INET;
-                    } else if (PF_INET6 == ainfo->ai_family) {
-                        struct sockaddr_in6 * saddr = (struct sockaddr_in6*) ainfo->ai_addr;
+                    } else if (PF_INET6 == selected->ai_family) {
+                        struct sockaddr_in6 * saddr = (struct sockaddr_in6*) selected->ai_addr;
                         memcpy( sn->addr.v6, &(saddr->sin6_addr), IPV6_SIZE );
                         sn->family = AF_INET6;
                     }
@@ -2954,30 +3286,115 @@ static int supernode2addr(n2n_sock_t * sn, int af, const n2n_sn_name_t addrIn) {
                     traceEvent(TRACE_WARNING, "Failed to resolve supernode IP address for %s", addr);
                 }
 
-                freeaddrinfo(ainfo); /* free everything allocated by getaddrinfo(). */
-                ainfo = NULL;
-
+                freeaddrinfo(ainfo);
                 err = 0;
             } else {
+                /* getaddrinfo failed, try public DNS: IPv4 first, then IPv6 if needed */
+                char ip_str[64];
+                int try_ipv6 = (af != AF_INET);
+                
+                if (query_dns_record(addr, ip_str, sizeof(ip_str), 0) == 0 &&
+                    inet_pton(AF_INET, ip_str, &sn->addr.v4) == 1) {
+                    sn->family = AF_INET;
+                    err = 0;
+                } else if (try_ipv6 && 
+                           query_dns_record(addr, ip_str, sizeof(ip_str), 1) == 0 &&
+                           inet_pton(AF_INET6, ip_str, &sn->addr.v6) == 1) {
+                    sn->family = AF_INET6;
+                    err = 0;
+                } else {
+                    /* Both methods failed */
 #if _WIN32
-                traceEvent(TRACE_WARNING, "Failed to resolve supernode host %s: %ls", addr, gai_strerror(err));
+                    traceEvent(TRACE_WARNING, "Failed to resolve supernode host %s: %ls", addr, gai_strerror(err));
 #else
-                traceEvent(TRACE_WARNING, "Failed to resolve supernode host %s: %s", addr, gai_strerror(err));
+                    traceEvent(TRACE_WARNING, "Failed to resolve supernode host %s: %s", addr, gai_strerror(err));
 #endif
-                err = -1;
-                if (ip_error != 0) {
-                    traceEvent(TRACE_DEBUG, "Failed to parse supernode as a numeric address %s: %s", addr, strerror(ip_error));
+                    err = -1;
                 }
             }
         } else {
             err = 0;
         }
+
     } else {
         traceEvent(TRACE_WARNING, "Wrong supernode parameter (-l <host:port>)");
         err = -1;
     }
 
     return err;
+}
+
+/* ***************************************************** */
+
+/** Check if supernode domain resolved to a new address and re-register if changed.
+ *  
+ *  Main-thread implementation: periodically re-resolves supernode domain when idle.
+ *  Checks every 300 seconds (5 minutes) and only when no communication in last 30 seconds.
+ *  If supernode domain resolves to a different address, update and re-register.
+ *  
+ *  @return 1 if address changed and re-registered, 0 otherwise
+ */
+static int check_supernode_domain_and_update(n2n_edge_t * eee, time_t now)
+{
+    n2n_sock_t new_addr;
+    
+    /* Skip if supernode is not a domain name (re_resolve_supernode_ip == 0) */
+    if (!eee->re_resolve_supernode_ip) {
+        return 0;
+    }
+    
+    /* Check every 300 seconds (5 minutes) */
+    if (eee->last_resolve_check != 0 && (now - eee->last_resolve_check) < 300) {
+        return 0;
+    }
+    
+    /* Only resolve if edge is idle (no P2P communication in last 30 seconds) */
+    /* Note: We don't check last_sup because regular keepalive would prevent updates */
+    if ((now - eee->last_p2p <= 30)) {
+        return 0;
+    }
+    
+    eee->last_resolve_check = now;
+    
+    /* Resolve supernode domain in main thread (may block briefly) */
+    memset(&new_addr, 0, sizeof(n2n_sock_t));
+    if (supernode2addr(&new_addr, eee->sn_af, eee->sn_ip_array[eee->sn_idx]) != 0) {
+        traceEvent(TRACE_WARNING, "Failed to resolve supernode domain");
+        return 0;
+    }
+    
+    /* Check if address changed */
+    if (eee->last_resolved_supernode.family != 0 &&
+        sock_equal(&eee->last_resolved_supernode, &new_addr) != 0)
+    {
+        n2n_sock_str_t new_str;
+        sock_to_cstr(new_str, &new_addr);
+        traceEvent(TRACE_NORMAL, "Supernode address updated to %s", new_str);
+        
+        /* Update supernode address and re-register */
+        eee->supernode = new_addr;
+        eee->last_resolved_supernode = new_addr;
+        
+        /* Clear alternate address - domain resolution already picked the best address */
+        memset(&eee->supernode_alt, 0, sizeof(n2n_sock_t));
+        
+        traceEvent(TRACE_NORMAL, "Re-registering with supernode at new address");
+        
+        /* Reset supernode connection state */
+        eee->sup_attempts = N2N_EDGE_SUP_ATTEMPTS;
+        eee->sn_wait = 0;
+        
+        send_register_super(eee, &(eee->supernode));
+        eee->last_register_req = now;
+        return 1;
+    }
+    else if (eee->last_resolved_supernode.family == 0)
+    {
+        /* First resolution - just store it */
+        eee->last_resolved_supernode = new_addr;
+    }
+    
+    return 0;
 }
 
 /* ***************************************************** */
@@ -3562,26 +3979,22 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
     }
 
     /* Resolve alternate address family for dual-stack registration */
+    /* Note: Alternate address will be resolved after socket creation when we know
+     * which address families are actually supported by the local system. */
     memset(&eee.supernode_alt, 0, sizeof(n2n_sock_t));
-    {
-        int alt_af = (eee.supernode.family == AF_INET6) ? AF_INET : AF_INET6;
-        if (supernode2addr(&eee.supernode_alt, alt_af, eee.sn_ip_array[eee.sn_idx]) == 0) {
-            n2n_sock_str_t sockbuf_alt;
-            traceEvent(TRACE_INFO, "Supernode alt address resolved: %s",
-                       sock_to_cstr(sockbuf_alt, &eee.supernode_alt));
-        } else {
-            memset(&eee.supernode_alt, 0, sizeof(n2n_sock_t));
-        }
-    }
 
     /* Check if supernode address is a domain name, enable periodic re-resolution */
+    /* Check if supernode address is a domain name (or TXT domain), enable periodic re-resolution */
     {
         char *supernode_host = eee.sn_ip_array[eee.sn_idx];
         struct in_addr ipv4_addr;
         struct in6_addr ipv6_addr;
+        /* Check if it's not a raw IP address */
         if (inet_pton(AF_INET, supernode_host, &ipv4_addr) != 1 &&
             inet_pton(AF_INET6, supernode_host, &ipv6_addr) != 1)
         {
+            /* It's a domain name - could be regular domain or TXT domain */
+            /* TXT domain has no port, regular domain has port */
             eee.re_resolve_supernode_ip = 1;
             traceEvent(TRACE_INFO, "Supernode '%s' is a domain name, enabling periodic resolution", supernode_host);
         }
@@ -3725,10 +4138,11 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
 
     /* Try to open IPv6 socket on same port for dual-stack support */
     eee.udp_sock6 = open_socket6(local_port, 1 /*bind ANY*/);
+    
+    /* Detect actual system connectivity by checking available address families */
+    int has_ipv4 = (eee.udp_sock != -1);
+    int has_ipv6 = 0;
     {
-        /* Detect actual system connectivity by checking available address families */
-        int has_ipv4 = (eee.udp_sock != -1);
-        int has_ipv6 = 0;
         if (eee.udp_sock6 != -1) {
             /* Check if system has any real IPv6 address (not just loopback) */
             struct ifaddrs *ifap = NULL;
@@ -3783,6 +4197,27 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
 
         if (eee.udp_sock6 == -1)
             traceEvent(TRACE_WARNING, "IPv6 UDP socket unavailable, IPv6 peers will use relay only");
+        
+        /* Resolve alternate supernode address only for pure IP addresses (not domains) */
+        if (eee.supernode_alt.family == 0) {
+            char *sn_host = eee.sn_ip_array[eee.sn_idx];
+            struct in_addr ipv4_test;
+            struct in6_addr ipv6_test;
+            
+            /* Check if it's a pure IP address */
+            if (inet_pton(AF_INET, sn_host, &ipv4_test) == 1 || 
+                inet_pton(AF_INET6, sn_host, &ipv6_test) == 1) {
+                
+                int alt_af = (eee.supernode.family == AF_INET6) ? AF_INET : AF_INET6;
+                int can_resolve = (alt_af == AF_INET6) ? has_ipv6 : has_ipv4;
+                
+                if (can_resolve && supernode2addr(&eee.supernode_alt, alt_af, sn_host) == 0) {
+                    n2n_sock_str_t sockbuf_alt;
+                    traceEvent(TRACE_INFO, "Supernode alt address resolved: %s",
+                               sock_to_cstr(sockbuf_alt, &eee.supernode_alt));
+                }
+            }
+        }
     }
 
 #if !defined(_WIN32)
@@ -3959,6 +4394,9 @@ static int run_loop(n2n_edge_t * eee )
 
         update_supernode_reg(eee, nowTime);
         check_punch_timeouts(eee, nowTime);
+        
+        /* Periodically check if supernode domain resolved to a new address */
+        check_supernode_domain_and_update(eee, nowTime);
 
         PEERS_LOCK(eee);
         check_keepalive(eee, nowTime);
@@ -4008,6 +4446,7 @@ cleanup:
 #ifdef _WIN32
     eee->keep_running = 0;
 #endif
+
     send_deregister( eee, &(eee->supernode));
 
     /* Notify all known peers */
