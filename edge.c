@@ -1058,8 +1058,9 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
 }
 
 #define KEEPALIVE_IDLE_SECONDS   20   /* send probe after this many seconds of silence */
-#define KEEPALIVE_TIMEOUT_SECONDS 25  /* remove peer if no reply within this many seconds after probe */
+#define KEEPALIVE_RETRY_INTERVAL  4   /* seconds between retries */
 #define KEEPALIVE_MAX_FAILS       3   /* remove peer after this many consecutive failures */
+#define KEEPALIVE_TOTAL_TIMEOUT   (KEEPALIVE_IDLE_SECONDS + KEEPALIVE_RETRY_INTERVAL * KEEPALIVE_MAX_FAILS)  /* 32s: give up after */
 
 static void update_peer_address(n2n_edge_t * eee,
                                 uint8_t from_supernode,
@@ -1075,10 +1076,22 @@ static void check_keepalive( n2n_edge_t * eee, time_t now )
     struct peer_info *prev = NULL;
     MACSTR_TMP(mac_tmp);
 
+    /* Skip keepalive entirely if there's recent direct P2P communication */
+    if (eee->last_p2p > 0 && (now - eee->last_p2p) < KEEPALIVE_IDLE_SECONDS)
+        return;
+
     while ( scan ) {
         struct peer_info *next = scan->next;
         time_t idle = now - scan->last_seen;
 
+        /* Skip keepalive for peers using relay (punch_failed=1).
+         * They communicate via supernode, so we don't send direct PROBEs.
+         * Their liveness is tracked through supernode relay activity. */
+        if ( scan->punch_failed ) {
+            prev = scan;
+            scan = next;
+            continue;
+        }
         /* Skip keepalive for IPv4-only peers if we have no IPv4 socket (shouldn't happen) */
         if ( scan->sock.family == AF_INET && eee->udp_sock == -1 ) {
             prev = scan;
@@ -1121,7 +1134,7 @@ static void check_keepalive( n2n_edge_t * eee, time_t now )
                 /* Got a reply: reset */
                 scan->last_probe_sent = 0;
                 scan->keepalive_fails = 0;
-            } else if ( (now - scan->last_probe_sent) >= (KEEPALIVE_TIMEOUT_SECONDS - KEEPALIVE_IDLE_SECONDS) ) {
+            } else if ( (now - scan->last_probe_sent) >= KEEPALIVE_RETRY_INTERVAL ) {
                 /* No reply within timeout */
                 scan->keepalive_fails++;
                 scan->last_probe_sent = 0;
@@ -1512,7 +1525,6 @@ static void update_peer_address(n2n_edge_t * eee,
                         sock_to_cstr(sockbuf1, &(scan->sock)),
                         sock_to_cstr(sockbuf2, peer) );
             scan->sock = *peer;
-            scan->last_seen = when;
         }
         else
         {
@@ -1522,8 +1534,9 @@ static void update_peer_address(n2n_edge_t * eee,
     else
     {
         /* Found and unchanged. */
-        scan->last_seen = when;
+        scan->sock = *peer;
     }
+    scan->last_seen = when;
 }
 
 /** @brief Check to see if we should re-register with the supernode.
@@ -1606,7 +1619,7 @@ static int find_peer_destination(n2n_edge_t * eee,
            (memcmp(mac_address, scan->mac_addr, N2N_MAC_SIZE) == 0))
         {
             /* If keepalive probe is pending but peer was recently active, still use direct */
-            if (scan->last_probe_sent > 0 && (now - scan->last_seen) > KEEPALIVE_TIMEOUT_SECONDS) {
+            if (scan->last_probe_sent > 0 && (now - scan->last_seen) > KEEPALIVE_TOTAL_TIMEOUT) {
                 break; /* retval stays 0, use supernode as fallback */
             }
             /* Prefer IPv6 direct if peer has IPv6 and we have IPv6 socket */
@@ -1933,7 +1946,9 @@ static int handle_PACKET( n2n_edge_t * eee,
     if (NULL == scan) {
         try_send_register(eee, from_supernode, pkt->srcMac, orig_sender);
     } else if (!from_supernode) {
-        /* P2P packet from known peer: only update address if it changed */
+        /* P2P packet from known peer: reset keepalive state and update address */
+        scan->last_probe_sent = 0;
+        scan->keepalive_fails = 0;
         if (0 != sock_equal(&scan->sock, orig_sender)) {
             update_peer_address(eee, from_supernode, pkt->srcMac, orig_sender, now);
         } else {
