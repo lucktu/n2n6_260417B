@@ -445,6 +445,14 @@ int tuntap_open(tuntap_dev *device, struct tuntap_config* config) {
         return -1;
     }
 
+    /* Log interface configuration success (TRACE_INFO - visible with -v) */
+    if (device->ip_addr != 0 && !config->dyn_ip4) {
+        struct in_addr a;
+        a.s_addr = device->ip_addr;
+        traceEvent(TRACE_INFO, "Interface %s configured with IP %s/%u",
+                   device->dev_name, inet_ntoa(a), device->ip_prefixlen);
+    }
+
     return(device->fd);
 }
 

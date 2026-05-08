@@ -552,7 +552,7 @@ static void edge_deinit(n2n_edge_t * eee)
 
     /* Remove UPnP/NAT-PMP port mapping on exit */
     if (eee->upnp_mapped_port != 0) {
-        traceEvent(TRACE_NORMAL, "Removing UPnP/NAT-PMP port mapping for port %u",
+        traceEvent(TRACE_NORMAL, "Removing upnp port mapping for port %u",
                    (unsigned)eee->upnp_mapped_port);
         upnp_unmap_port(eee->upnp_mapped_port);
         eee->upnp_mapped_port = 0;
@@ -763,10 +763,10 @@ static void set_localip( n2n_edge_t * eee )
     closesocket(fd);
 
     if (eee->local_sock_ena)
-        traceEvent(TRACE_NORMAL, "Local LAN socket: %s",
+        traceEvent(TRACE_NORMAL, "Local lan socket: %s",
                    sock_to_cstr(sockbuf, &eee->local_sock));
     else
-        traceEvent(TRACE_WARNING, "set_localip: no private LAN address found");
+        traceEvent(TRACE_WARNING, "set_localip: no private lan address found");
 }
 
 /** Send a QUERY_PEER packet to supernode asking for target's address. */
@@ -2990,10 +2990,12 @@ static void readFromIPSocket( n2n_edge_t * eee, SOCKET fd )
                             else
                                 caps_str = "unknown (old supernode)";
                             traceEvent(TRACE_NORMAL, "Supernode support: %s", caps_str);
-                            traceEvent(TRACE_NORMAL, "[OK] Edge Peer <<< =======64======= >>> Super Node");
+                            traceEvent(TRACE_NORMAL, "[OK] edge <<< ======= %s ======= >>> supernode",
+                                       eee->supernode.family == AF_INET6 ? "IPv6" : "IPv4");
                             first_ok_message_shown = 1;
                         } else {
-                            traceEvent(TRACE_DEBUG, "[OK] Edge Peer <<< =======64======= >>> Super Node");
+                            traceEvent(TRACE_DEBUG, "[OK] edge <<< ======= %s ======= >>> supernode",
+                                       eee->supernode.family == AF_INET6 ? "IPv6" : "IPv4");
                         }
 
                         if (!initial_connection_complete && eee->daemon) {
@@ -4169,14 +4171,14 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
         exit(1);
     }
 
-    traceEvent( TRACE_NORMAL, "Starting n2n edge %s %s", n2n_sw_version, n2n_sw_buildDate );
+    traceEvent( TRACE_NORMAL, "Starting edge %s", n2n_sw_version );
 
     for (int i = 0; i< eee.sn_num; ++i) {
         /* Skip the default supernode (last one if it matches default) */
         if (strcmp(eee.sn_ip_array[i], "ouno.eu.org:10084") == 0) {
             continue; // Skip displaying default
         }
-        traceEvent( TRACE_NORMAL, "supernode %u => %s\n", i, (eee.sn_ip_array[i]) );
+        traceEvent( TRACE_NORMAL, "Supernode %u => %s\n", i, (eee.sn_ip_array[i]) );
     }
 
     while (supernode2addr( &(eee.supernode), eee.sn_af, eee.sn_ip_array[eee.sn_idx] ) != 0) {
@@ -4400,12 +4402,11 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
         }
 
         if (has_ipv4 && has_ipv6)
-            traceEvent(TRACE_NORMAL, "Dual-stack: IPv4+IPv6 sockets ready (supernode via %s)",
-                       eee.supernode.family == AF_INET6 ? "IPv6" : "IPv4");
+            traceEvent(TRACE_NORMAL, "Edge support: IPv4+IPv6 (dual-stack)");
         else if (has_ipv6)
-            traceEvent(TRACE_NORMAL, "Only IPv6 socket ready");
+            traceEvent(TRACE_NORMAL, "Edge support: IPv6 only");
         else
-            traceEvent(TRACE_NORMAL, "Only IPv4 socket ready");
+            traceEvent(TRACE_NORMAL, "Edge support: IPv4 only");
 
         if (eee.udp_sock6 == -1)
             traceEvent(TRACE_WARNING, "IPv6 UDP socket unavailable, IPv6 peers will use relay only");
@@ -4460,7 +4461,7 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
     }
 #endif
 
-    traceEvent(TRACE_NORMAL, "edge started");
+    traceEvent(TRACE_NORMAL, "Edge started");
 
     /* Attempt UPnP/NAT-PMP port mapping so external peers can reach us.
      * This is compiled in by default and runs automatically at startup.
@@ -4480,16 +4481,16 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
 
         if (actual_port > 0) {
             uint16_t mapped = 0;
-            traceEvent(TRACE_INFO, "UPnP/NAT-PMP: attempting port mapping for UDP port %u",
+            traceEvent(TRACE_INFO, "Upnp: attempting port mapping for UDP port %u",
                        (unsigned)actual_port);
             if (upnp_map_port(actual_port, actual_port, &mapped) == UPNP_OK) {
                 traceEvent(TRACE_NORMAL,
-                           "UPnP/NAT-PMP: mapped UDP port %u",
+                           "Upnp: mapped udp port %u",
                            (unsigned)mapped);
                 eee.upnp_mapped_port = mapped;
             } else {
                 traceEvent(TRACE_INFO,
-                           "UPnP/NAT-PMP: no gateway found or mapping failed (NAT traversal via supernode only)");
+                           "Upnp: ... mapping failed");
             }
         }
     }
@@ -4642,11 +4643,11 @@ static int run_loop(n2n_edge_t * eee )
                 local_port = ntohs(bound.sin_port);
 
             if (upnp_renew_port(local_port, eee->upnp_mapped_port) == UPNP_OK) {
-                traceEvent(TRACE_INFO, "UPnP/NAT-PMP: lease renewed for port %u",
+                traceEvent(TRACE_INFO, "Upnp: lease renewed for port %u",
                            (unsigned)eee->upnp_mapped_port);
             } else {
                 traceEvent(TRACE_WARNING,
-                           "UPnP/NAT-PMP: lease renewal failed for port %u",
+                           "Upnp: lease renewal failed for port %u",
                            (unsigned)eee->upnp_mapped_port);
             }
             lastUpnpRenew = nowTime;
