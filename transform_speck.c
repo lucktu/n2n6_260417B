@@ -72,7 +72,7 @@ ssize_t transop_encode_speck(n2n_trans_op_t *arg,
     /* Version byte */
     outbuf[idx++] = N2N_SPECK_TRANSFORM_VERSION;
 
-    /* Generate and encode the IV using n2n_rand for compatibility */
+    /* Generate and encode the IV using cryptographically secure random source */
     set_speck_iv(priv, nonce);
     memcpy(outbuf + idx, nonce, N2N_SPECK_NONCE_SIZE);
     idx += N2N_SPECK_NONCE_SIZE;

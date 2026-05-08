@@ -21,6 +21,7 @@
 #else
 #include <sys/select.h>
 #include <arpa/inet.h>
+#include <netinet/in.h>
 #define SOCKET_INVALID -1
 #define CLOSE_SOCKET(s) close(s)
 #endif
@@ -994,6 +995,25 @@ static int process_mgmt( n2n_sn_t * sss,
     uint32_t num_edges = 0;
 
     traceEvent( TRACE_DEBUG, "process_mgmt" );
+
+    /* Only allow localhost connections for security */
+    int is_localhost = 0;
+    if (sender_sock->sa_family == AF_INET) {
+        uint32_t addr = ((struct sockaddr_in*)sender_sock)->sin_addr.s_addr;
+        is_localhost = (addr == htonl(INADDR_LOOPBACK)) || (addr == 0);
+    } else if (sender_sock->sa_family == AF_INET6) {
+        struct in6_addr *a6 = &((struct sockaddr_in6*)sender_sock)->sin6_addr;
+        is_localhost = (memcmp(a6, &in6addr_loopback, sizeof(*a6)) == 0);
+    }
+    if (!is_localhost) {
+        char tmp[INET6_ADDRSTRLEN] = "unknown";
+        if (sender_sock->sa_family == AF_INET)
+            inet_ntop(AF_INET, &((struct sockaddr_in*)sender_sock)->sin_addr, tmp, sizeof(tmp));
+        else if (sender_sock->sa_family == AF_INET6)
+            inet_ntop(AF_INET6, &((struct sockaddr_in6*)sender_sock)->sin6_addr, tmp, sizeof(tmp));
+        traceEvent(TRACE_WARNING, "mgmt request from non-localhost %s rejected", tmp);
+        return -1;
+    }
 
     /* Send header */
     ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,

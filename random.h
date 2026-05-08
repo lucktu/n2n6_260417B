@@ -1,8 +1,10 @@
 /**
  * @brief Random number generation for n2n
  *
- * Uses XORSHIFT128+ (same as cnn2n) for platform-independent random numbers.
- * No external crypto library dependency.
+ * Uses cryptographically secure random sources:
+ *   - Windows: BCryptGenRandom
+ *   - Linux: getrandom() or /dev/urandom
+ *   - BSD/macOS: getentropy() or /dev/urandom
  */
 
 #ifndef N2N_RANDOM_H_
@@ -13,81 +15,125 @@
 #include <string.h>
 #include <time.h>
 
-/* Windows: use BCrypt only for the NULL-ctx path in edge.c (send_register_super) */
 #if defined(_WIN32)
 #include <windows.h>
 #include <bcrypt.h>
+#elif defined(__linux__)
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <errno.h>
+#include <fcntl.h>
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+#include <unistd.h>
+#include <sys/random.h>
+#include <errno.h>
+#include <fcntl.h>
 #endif
 
-/* ---------- XORSHIFT128+ state (same as cnn2n) ----------
- * Note: _n2n_rng is a global, but thread safety is not a concern here:
- *   - Windows uses BCryptGenRandom in random_bytes_buf, never touches _n2n_rng
- *   - Linux/BSD edge is single-threaded (no tunReadThread)
- * If multi-threaded Linux support is added in future, protect with a mutex. */
-typedef struct { uint64_t a, b; } n2n_rng_state_t;
+/* ---------- random_bytes: fill buffer with cryptographically secure random bytes ---------- */
+static inline int random_bytes_buf(uint8_t *buf, size_t n) {
+    if (n == 0) return 0;
 
-static n2n_rng_state_t _n2n_rng = {
-    0x9E3779B97F4A7C15ULL,
-    0xBF58476D1CE4E5B9ULL
-};
-
-static inline uint64_t n2n_rand(void) {
-    uint64_t t = _n2n_rng.a;
-    uint64_t s = _n2n_rng.b;
-    _n2n_rng.a = s;
-    t ^= t << 23;
-    t ^= t >> 17;
-    t ^= s ^ (s >> 26);
-    _n2n_rng.b = t;
-    return t + s;
-}
-
-static inline void n2n_srand(uint64_t seed) {
-    /* splitmix64 to initialise */
-    uint64_t z = seed + 0x9E3779B97F4A7C15ULL;
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-    _n2n_rng.a = z ^ (z >> 31);
-    z += 0x9E3779B97F4A7C15ULL;
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-    _n2n_rng.b = z ^ (z >> 31);
-    /* warm up */
-    for (int i = 0; i < 32; i++) n2n_rand();
-}
-
-/* ---------- random_bytes: fill buffer with random bytes ---------- */
-static inline void random_bytes_buf(uint8_t *buf, size_t n) {
 #if defined(_WIN32)
-    BCryptGenRandom(NULL, buf, (ULONG)n, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    NTSTATUS status = BCryptGenRandom(NULL, buf, (ULONG)n, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    return (status == 0) ? 0 : -1;
+
+#elif defined(__linux__)
+    /* Try getrandom() first (Linux 3.17+) */
+    size_t done;
+#if defined(SYS_getrandom)
+    done = 0;
+    while (done < n) {
+        ssize_t ret = syscall(SYS_getrandom, buf + done, n - done, 0);
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        done += (size_t)ret;
+    }
+    if (done == n) return 0;
+#endif
+    /* Fallback to /dev/urandom */
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) return -1;
+    done = 0;
+    while (done < n) {
+        ssize_t ret = read(fd, buf + done, n - done);
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            close(fd);
+            return -1;
+        }
+        done += (size_t)ret;
+    }
+    close(fd);
+    return 0;
+
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    /* Try getentropy() first (OpenBSD 5.6+, FreeBSD 12.0+, macOS 10.12+) */
+    size_t done;
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__)
+    done = 0;
+    while (done < n) {
+        size_t chunk = (n - done > 256) ? 256 : (n - done);
+        if (getentropy(buf + done, chunk) != 0) {
+            break;
+        }
+        done += chunk;
+    }
+    if (done == n) return 0;
+#endif
+    /* Fallback to /dev/urandom */
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) return -1;
+    done = 0;
+    while (done < n) {
+        ssize_t ret = read(fd, buf + done, n - done);
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            close(fd);
+            return -1;
+        }
+        done += (size_t)ret;
+    }
+    close(fd);
+    return 0;
+
 #else
-    /* Use n2n_rand() - same approach as cnn2n */
-    size_t i = 0;
-    while (i + 8 <= n) {
-        uint64_t v = n2n_rand();
-        memcpy(buf + i, &v, 8);
-        i += 8;
+    /* Unknown platform: try /dev/urandom as last resort */
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) return -1;
+    size_t done = 0;
+    while (done < n) {
+        ssize_t ret = read(fd, buf + done, n - done);
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            close(fd);
+            return -1;
+        }
+        done += (size_t)ret;
     }
-    if (i < n) {
-        uint64_t v = n2n_rand();
-        memcpy(buf + i, &v, n - i);
-    }
+    close(fd);
+    return 0;
 #endif
 }
 
 /* ---------- Compatibility shim for old callers using random_ctx_t ---------- */
-struct random_ctx { int _unused; };  /* empty struct, RNG state is global */
+struct random_ctx { int _unused; };  /* empty struct */
 typedef struct random_ctx *random_ctx_t;
 
 static inline void random_init(random_ctx_t ctx) {
     (void)ctx;
-    n2n_srand((uint64_t)time(NULL) ^ (uint64_t)(uintptr_t)&ctx);
+    /* No initialization needed - we use system CSPRNG */
 }
 static inline void random_free(random_ctx_t ctx) { (void)ctx; }
 
 static inline void random_bytes(random_ctx_t ctx, uint8_t *buf, size_t n) {
     (void)ctx;
-    random_bytes_buf(buf, n);
+    if (random_bytes_buf(buf, n) != 0) {
+        /* Fatal error: cannot generate secure random bytes */
+        abort();
+    }
 }
 
 #endif /* N2N_RANDOM_H_ */

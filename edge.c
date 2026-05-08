@@ -2217,11 +2217,21 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
 #endif
             {
                 char tmp[INET6_ADDRSTRLEN] = "unknown";
-                if (((struct sockaddr*)&sender_sock)->sa_family == AF_INET)
+                int is_localhost = 0;
+                if (((struct sockaddr*)&sender_sock)->sa_family == AF_INET) {
                     inet_ntop(AF_INET, &((struct sockaddr_in*)&sender_sock)->sin_addr, tmp, sizeof(tmp));
-                else if (((struct sockaddr*)&sender_sock)->sa_family == AF_INET6)
+                    uint32_t addr = ((struct sockaddr_in*)&sender_sock)->sin_addr.s_addr;
+                    is_localhost = (addr == htonl(INADDR_LOOPBACK)) || (addr == 0);
+                } else if (((struct sockaddr*)&sender_sock)->sa_family == AF_INET6) {
                     inet_ntop(AF_INET6, &((struct sockaddr_in6*)&sender_sock)->sin6_addr, tmp, sizeof(tmp));
+                    struct in6_addr *a6 = &((struct sockaddr_in6*)&sender_sock)->sin6_addr;
+                    is_localhost = (memcmp(a6, &in6addr_loopback, sizeof(*a6)) == 0);
+                }
                 traceEvent( TRACE_INFO, "mgmt pkg from %s", tmp);
+                if (!is_localhost) {
+                    traceEvent( TRACE_WARNING, "mgmt request from non-localhost %s rejected", tmp);
+                    return;
+                }
             }
 #ifndef _WIN32
         }

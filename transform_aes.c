@@ -64,8 +64,7 @@ static ssize_t transop_encode_aes(n2n_trans_op_t *arg,
     n2n_aes_ivec_t enc_ivec = {0};
 
     encode_uint8(outbuf, &idx, N2N_AES_TRANSFORM_VERSION);
-    uint64_t rv = n2n_rand();
-    memcpy(iv_seed, &rv, sizeof(rv));
+    random_bytes_buf(iv_seed, TRANSOP_AES_IV_SEED_SIZE);
     encode_buf(outbuf, &idx, iv_seed, TRANSOP_AES_IV_SEED_SIZE);
 
     memcpy(assembly, inbuf, in_len);

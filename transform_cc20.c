@@ -45,10 +45,8 @@ static ssize_t transop_encode_cc20(n2n_trans_op_t *arg,
 
     encode_uint8(outbuf, &idx, N2N_CC20_TRANSFORM_VERSION);
 
-    /* IV from n2n_rand() - same as cnn2n */
-    uint64_t *p = (uint64_t *)enc_ivec;
-    p[0] = n2n_rand();
-    p[1] = n2n_rand();
+    /* IV from cryptographically secure random source */
+    random_bytes_buf(enc_ivec, N2N_CC20_IVEC_SIZE);
     encode_buf(outbuf, &idx, enc_ivec, N2N_CC20_IVEC_SIZE);
 
     cc20_crypt(outbuf + TRANSOP_CC20_PREAMBLE_SIZE, inbuf, in_len, enc_ivec, priv->ctx);
