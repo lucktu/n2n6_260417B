@@ -702,12 +702,15 @@ static int update_edge( n2n_sn_t * sss,
 
         memcpy(scan->community_name, community, sizeof(n2n_community_t) );
         memcpy(&(scan->mac_addr), edgeMac, sizeof(n2n_mac_t));
-        memcpy(&(scan->sock), sender_sock, sizeof(n2n_sock_t));
-        /* Also record in the appropriate typed slot */
-        if (sender_sock->family == AF_INET6)
+        
+        /* Store address in the correct slot based on family */
+        if (sender_sock->family == AF_INET6) {
             memcpy(&(scan->sock6), sender_sock, sizeof(n2n_sock_t));
-        else
-            memset(&(scan->sock6), 0, sizeof(n2n_sock_t));
+            /* sock remains 0 from calloc */
+        } else {
+            memcpy(&(scan->sock), sender_sock, sizeof(n2n_sock_t));
+            /* sock6 remains 0 from calloc */
+        }
 
         if (version) {
             strncpy(scan->version, version, sizeof(scan->version) - 1);
@@ -726,18 +729,34 @@ static int update_edge( n2n_sn_t * sss,
         scan->next = sss->edges;
         sss->edges = scan;
 
-        scan->num_sockets  = local_sock_ena ? 2 : 1;
-        scan->sockets[0]   = scan->sock;
-        if (local_sock_ena && local_sock)
-            scan->sockets[1] = *local_sock;
+        /* Build sockets array for hole-punching */
+        /* For dual-stack: sockets[0] = IPv4 (if available), sock6 = IPv6 (if available) */
+        /* This allows edges to try both addresses in parallel */
+        scan->num_sockets = 0;
+        if (scan->sock.family == AF_INET) {
+            scan->sockets[scan->num_sockets++] = scan->sock;
+        } else if (scan->sock6.family == AF_INET6) {
+            /* IPv6-only: put IPv6 in sockets[0] */
+            scan->sockets[scan->num_sockets++] = scan->sock6;
+        }
+        if (local_sock_ena && local_sock) {
+            scan->sockets[scan->num_sockets++] = *local_sock;
+        }
 
         {
             struct in_addr vip_addr;
             vip_addr.s_addr = htonl(scan->assigned_ip);
+            char addr_buf[64];
+            if (scan->sock.family == AF_INET)
+                sock_to_cstr(addr_buf, &scan->sock);
+            else if (scan->sock6.family == AF_INET6)
+                sock_to_cstr(addr_buf, &scan->sock6);
+            else
+                strcpy(addr_buf, "-");
             traceEvent( TRACE_NORMAL, "update_edge created   %s vip=%s ==> %s%s",
                         macaddr_str( mac_buf, edgeMac ),
                         inet_ntoa(vip_addr),
-                        sock_to_cstr( sockbuf, &scan->sockets[0] ),
+                        addr_buf,
                         scan->num_sockets > 1 ? " (LAN)" : "" );
         }
 
@@ -747,8 +766,15 @@ static int update_edge( n2n_sn_t * sss,
     else
     {
         /* Known */
-        if ( (0 != memcmp(community, scan->community_name, sizeof(n2n_community_t))) ||
-             (0 != sock_equal(sender_sock, &(scan->sock) )) )
+        /* Check if this is an update (community or address changed) */
+        int addr_changed = 0;
+        if (sender_sock->family == AF_INET6) {
+            addr_changed = (0 != sock_equal(sender_sock, &(scan->sock6)));
+        } else {
+            addr_changed = (0 != sock_equal(sender_sock, &(scan->sock)));
+        }
+        
+        if ( (0 != memcmp(community, scan->community_name, sizeof(n2n_community_t))) || addr_changed )
         {
             /* Alt-family registration: only update the other-family address, don't overwrite primary */
             if (scan->sock.family != 0 && sender_sock->family != scan->sock.family) {
@@ -766,11 +792,15 @@ static int update_edge( n2n_sn_t * sss,
             }
 
             memcpy(scan->community_name, community, sizeof(n2n_community_t) );
-            memcpy(&(scan->sock), sender_sock, sizeof(n2n_sock_t));
-            if (sender_sock->family == AF_INET6)
+            
+            /* Store address in the correct slot based on family */
+            if (sender_sock->family == AF_INET6) {
                 memcpy(&(scan->sock6), sender_sock, sizeof(n2n_sock_t));
-            else if (scan->sock6.family == 0)
-                memset(&(scan->sock6), 0, sizeof(n2n_sock_t));
+                /* Don't clear sock - it may have IPv4 from earlier registration */
+            } else {
+                memcpy(&(scan->sock), sender_sock, sizeof(n2n_sock_t));
+                /* Don't clear sock6 - it may have IPv6 from earlier registration */
+            }
 
             if (version) {
                 strncpy(scan->version, version, sizeof(scan->version) - 1);
@@ -785,13 +815,17 @@ static int update_edge( n2n_sn_t * sss,
                         macaddr_str( mac_buf, edgeMac ),
                         sock_to_cstr( sockbuf, sender_sock ) );
 
+            /* Build sockets array for hole-punching */
+            /* For dual-stack: sockets[0] = IPv4 (if available), sock6 = IPv6 (if available) */
+            scan->num_sockets = 0;
+            if (scan->sock.family == AF_INET) {
+                scan->sockets[scan->num_sockets++] = scan->sock;
+            } else if (scan->sock6.family == AF_INET6) {
+                /* IPv6-only: put IPv6 in sockets[0] */
+                scan->sockets[scan->num_sockets++] = scan->sock6;
+            }
             if (local_sock_ena && local_sock) {
-                scan->num_sockets  = 2;
-                scan->sockets[0]   = scan->sock;
-                scan->sockets[1]   = *local_sock;
-            } else {
-                scan->num_sockets  = 1;
-                scan->sockets[0]   = scan->sock;
+                scan->sockets[scan->num_sockets++] = *local_sock;
             }
 
             scan->last_seen = now;
@@ -1545,6 +1579,10 @@ static int process_udp( n2n_sn_t * sss,
                 pi2.sockets[0] = requester->sockets[0];
                 if (pi2.aflags & N2N_AFLAGS_LOCAL_SOCKET)
                     pi2.sockets[1] = requester->sockets[1];
+                if (requester->sock6.family == AF_INET6) {
+                    pi2.aflags |= N2N_AFLAGS_IPV6_SOCKET;
+                    pi2.sock6 = requester->sock6;
+                }
 
                 encode_PEER_INFO( encbuf2, &encx2, &cmn3, &pi2 );
                 /* Send to B via appropriate socket */
