@@ -1775,6 +1775,11 @@ static int process_udp( n2n_sn_t * sss,
                                macaddr_str(mac_buf, p->mac_addr),
                                macaddr_str(mac_buf2, reg.edgeMac));
 
+                    /* Do NOT push new edge's info to existing peers on registration.
+                     * Peers will learn about each other only when they actually communicate
+                     * (via QUERY_PEER mechanism). This prevents unnecessary peer discovery
+                     * and maintains privacy - other peers don't know when a new edge joins. */
+                    #if 0
                     {
                         struct sockaddr_storage peer_sa;
                         socklen_t peer_sa_len;
@@ -1802,6 +1807,7 @@ static int process_udp( n2n_sn_t * sss,
                         traceEvent(TRACE_DEBUG, "pushed A's new addr to peer %s (simultaneous open)",
                                    macaddr_str(mac_buf, p->mac_addr));
                     }
+                    #endif
                 }
                 p = p->next;
             }
